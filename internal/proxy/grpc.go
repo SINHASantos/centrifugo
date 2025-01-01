@@ -7,12 +7,13 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/centrifugal/centrifugo/v4/internal/middleware"
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v5/internal/middleware"
+	"github.com/centrifugal/centrifugo/v5/internal/proxyproto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -47,7 +48,7 @@ func getGrpcHost(endpoint string) (string, error) {
 	return host, nil
 }
 
-func getDialOpts(p Proxy) ([]grpc.DialOption, error) {
+func getDialOpts(p Config) ([]grpc.DialOption, error) {
 	var dialOpts []grpc.DialOption
 	if p.GrpcCredentialsKey != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&rpcCredentials{
@@ -55,7 +56,13 @@ func getDialOpts(p Proxy) ([]grpc.DialOption, error) {
 			value: p.GrpcCredentialsValue,
 		}))
 	}
-	if p.GrpcCertFile != "" {
+	if p.GrpcTLS.Enabled {
+		tlsConfig, err := p.GrpcTLS.ToGoTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TLS config %v", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	} else if p.GrpcCertFile != "" {
 		cred, err := credentials.NewClientTLSFromFile(p.GrpcCertFile, "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS credentials %v", err)
@@ -64,22 +71,24 @@ func getDialOpts(p Proxy) ([]grpc.DialOption, error) {
 	} else {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
+	if p.GrpcCompression {
+		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
+	}
 
 	if p.testGrpcDialer != nil {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(p.testGrpcDialer))
 	}
 
-	dialOpts = append(dialOpts, grpc.WithBlock())
 	return dialOpts, nil
 }
 
-func grpcRequestContext(ctx context.Context, proxy Proxy) context.Context {
+func grpcRequestContext(ctx context.Context, proxy Config) context.Context {
 	md := requestMetadata(ctx, proxy.HttpHeaders, proxy.GrpcMetadata)
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
-func httpRequestHeaders(ctx context.Context, proxy Proxy) http.Header {
-	return requestHeaders(ctx, proxy.HttpHeaders, proxy.GrpcMetadata)
+func httpRequestHeaders(ctx context.Context, proxy Config) http.Header {
+	return requestHeaders(ctx, proxy.HttpHeaders, proxy.GrpcMetadata, proxy.StaticHttpHeaders)
 }
 
 func requestMetadata(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string) metadata.MD {
@@ -101,10 +110,13 @@ func requestMetadata(ctx context.Context, allowedHeaders []string, allowedMetaKe
 	return requestMD
 }
 
-func requestHeaders(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string) http.Header {
-	headers := http.Header{}
+func requestHeaders(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string, staticHeaders map[string]string) http.Header {
 	if headers, ok := middleware.GetHeadersFromContext(ctx); ok {
-		return getProxyHeader(headers, allowedHeaders)
+		return getProxyHeader(headers, allowedHeaders, staticHeaders)
+	}
+	headers := http.Header{}
+	for k, v := range staticHeaders {
+		headers.Set(k, v)
 	}
 	headers.Set("Content-Type", "application/json")
 	md, _ := metadata.FromIncomingContext(ctx)

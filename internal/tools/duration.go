@@ -10,21 +10,6 @@ import (
 	"github.com/mitchellh/mapstructure"
 )
 
-// DecoderConfig returns default mapstructure.DecoderConfig with support
-// of time.Duration values & string slices & Duration
-func DecoderConfig(output interface{}) *mapstructure.DecoderConfig {
-	return &mapstructure.DecoderConfig{
-		Metadata:         nil,
-		Result:           output,
-		WeaklyTypedInput: true,
-		DecodeHook: mapstructure.ComposeDecodeHookFunc(
-			StringToDurationHookFunc(),
-			mapstructure.StringToTimeDurationHookFunc(),
-			mapstructure.StringToSliceHookFunc(","),
-		),
-	}
-}
-
 type Duration time.Duration
 
 // StringToDurationHookFunc returns a DecodeHookFunc that converts
@@ -33,7 +18,7 @@ func StringToDurationHookFunc() mapstructure.DecodeHookFunc {
 	return func(
 		f reflect.Type,
 		t reflect.Type,
-		data interface{}) (interface{}, error) {
+		data any) (any, error) {
 		if f.Kind() != reflect.String {
 			return data, nil
 		}
@@ -51,7 +36,7 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 }
 
 func (d *Duration) UnmarshalJSON(b []byte) error {
-	var v interface{}
+	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}

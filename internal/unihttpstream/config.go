@@ -1,12 +1,14 @@
 package unihttpstream
 
-import "github.com/centrifugal/centrifuge"
+import (
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
+
+	"github.com/centrifugal/centrifuge"
+)
 
 type Config struct {
-	// ProtocolVersion used by default. If not set then we use centrifuge.ProtocolVersion1.
-	ProtocolVersion centrifuge.ProtocolVersion
 	// MaxRequestBodySize limits request body size.
-	MaxRequestBodySize int
-
+	MaxRequestBodySize      int
+	ConnectCodeToHTTPStatus tools.ConnectCodeToHTTPStatus
 	centrifuge.PingPongConfig
 }

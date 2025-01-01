@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/centrifugal/centrifugo/v4/internal/tools"
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/stretchr/testify/require"
@@ -161,9 +161,8 @@ func TestHandleRPCWithProxyServerCustomDisconnect(t *testing.T) {
 	defer httpTestCase.Teardown()
 
 	expectedErr := centrifuge.Disconnect{
-		Code:      4000,
-		Reason:    "custom disconnect",
-		Reconnect: false,
+		Code:   4000,
+		Reason: "custom disconnect",
 	}
 
 	cases := newRPCHandlerTestCases(httpTestCase, grpcTestCase)

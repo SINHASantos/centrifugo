@@ -4,8 +4,8 @@ import (
 	"encoding/base64"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,7 +73,7 @@ func (h *PublishHandler) Handle(node *centrifuge.Node) PublishHandlerFunc {
 		if h.config.GranularProxyMode {
 			proxyName := chOpts.PublishProxyName
 			if proxyName == "" {
-				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "publish proxy not configured for a channel", map[string]interface{}{"channel": e.Channel}))
+				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "publish proxy not configured for a channel", map[string]any{"channel": e.Channel}))
 				return centrifuge.PublishReply{}, centrifuge.ErrorNotAvailable
 			}
 			p = h.config.Proxies[proxyName]
@@ -117,7 +117,7 @@ func (h *PublishHandler) Handle(node *centrifuge.Node) PublishHandlerFunc {
 			summary.Observe(duration)
 			histogram.Observe(duration)
 			errors.Inc()
-			node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error proxying publish", map[string]interface{}{"error": err.Error()}))
+			node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error proxying publish", map[string]any{"error": err.Error()}))
 			return centrifuge.PublishReply{}, centrifuge.ErrorInternal
 		}
 		summary.Observe(duration)
@@ -132,6 +132,7 @@ func (h *PublishHandler) Handle(node *centrifuge.Node) PublishHandlerFunc {
 
 		historySize := chOpts.HistorySize
 		historyTTL := chOpts.HistoryTTL
+		historyMetaTTL := chOpts.HistoryMetaTTL
 
 		data := e.Data
 		if publishRep.Result != nil {
@@ -140,7 +141,7 @@ func (h *PublishHandler) Handle(node *centrifuge.Node) PublishHandlerFunc {
 			} else if publishRep.Result.B64Data != "" {
 				decodedData, err := base64.StdEncoding.DecodeString(publishRep.Result.B64Data)
 				if err != nil {
-					node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 data", map[string]interface{}{"client": client.ID(), "error": err.Error()}))
+					node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 data", map[string]any{"client": client.ID(), "error": err.Error()}))
 					return centrifuge.PublishReply{}, centrifuge.ErrorInternal
 				}
 				data = decodedData
@@ -155,7 +156,7 @@ func (h *PublishHandler) Handle(node *centrifuge.Node) PublishHandlerFunc {
 		result, err := node.Publish(
 			e.Channel, data,
 			centrifuge.WithClientInfo(e.ClientInfo),
-			centrifuge.WithHistory(historySize, time.Duration(historyTTL)),
+			centrifuge.WithHistory(historySize, time.Duration(historyTTL), time.Duration(historyMetaTTL)),
 		)
 		return centrifuge.PublishReply{Result: &result}, err
 	}

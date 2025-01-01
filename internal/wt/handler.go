@@ -2,13 +2,12 @@ package wt
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/centrifugal/protocol"
-	"github.com/marten-seemann/webtransport-go"
+	"github.com/quic-go/webtransport-go"
 )
 
 // Handler for WebTransport.
@@ -29,7 +28,7 @@ const bidiStreamAcceptTimeout = 10 * time.Second
 func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	conn, err := s.server.Upgrade(rw, r)
 	if err != nil {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "error upgrading to webtransport", map[string]interface{}{"error": err.Error()}))
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "error upgrading to webtransport", map[string]any{"error": err.Error()}))
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -39,7 +38,7 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	stream, err := conn.AcceptStream(acceptCtx)
 	if err != nil {
 		acceptCtxCancel()
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "stream accept error", map[string]interface{}{"error": err.Error()}))
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "stream accept error", map[string]any{"error": err.Error()}))
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -53,15 +52,15 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	transport := newWebtransportTransport(protoType, conn, stream, s.config.PingPongConfig)
 	c, closeFn, err := centrifuge.NewClient(r.Context(), s.node, transport)
 	if err != nil {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error creating client", map[string]interface{}{"transport": transportName}))
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error creating client", map[string]any{"transport": transportName}))
 		return
 	}
 	defer func() { _ = closeFn() }()
 
 	if s.node.LogEnabled(centrifuge.LogLevelDebug) {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]interface{}{"client": c.ID(), "transport": transportName}))
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]any{"client": c.ID(), "transport": transportName}))
 		defer func(started time.Time) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]interface{}{"client": c.ID(), "transport": transportName, "duration": time.Since(started)}))
+			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]any{"client": c.ID(), "transport": transportName, "duration": time.Since(started).String()}))
 		}(time.Now())
 	}
 
@@ -73,15 +72,11 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	for {
-		cmd, data, err := decoder.Decode()
+		cmd, cmdSize, err := decoder.Decode()
 		if err != nil {
-			c.Disconnect(centrifuge.DisconnectBadRequest)
 			return
 		}
-		if s.node.LogEnabled(centrifuge.LogLevelTrace) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelTrace, "<--", map[string]interface{}{"client": c.ID(), "user": c.UserID(), "data": fmt.Sprintf("%#v", string(data))}))
-		}
-		ok := c.HandleCommand(cmd)
+		ok := c.HandleCommand(cmd, cmdSize)
 		if !ok {
 			return
 		}

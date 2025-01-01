@@ -1,9 +1,12 @@
 package unihttpstream
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/centrifugal/protocol"
@@ -15,14 +18,13 @@ type Handler struct {
 }
 
 func NewHandler(n *centrifuge.Node, c Config) *Handler {
-	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = centrifuge.ProtocolVersion1
-	}
 	return &Handler{
 		node:   n,
 		config: c,
 	}
 }
+
+const streamWriteTimeout = time.Second
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
@@ -36,17 +38,17 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBytesSize)
 		connectRequestData, err := io.ReadAll(r.Body)
 		if err != nil {
+			h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "error reading uni http stream request body", map[string]any{"error": err.Error()}))
 			if len(connectRequestData) >= int(maxBytesSize) {
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 				return
 			}
-			h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error reading body", map[string]interface{}{"error": err.Error()}))
 			return
 		}
-		req, err = protocol.NewJSONParamsDecoder().DecodeConnect(connectRequestData)
+		err = json.Unmarshal(connectRequestData, &req)
 		if err != nil {
 			if h.node.LogEnabled(centrifuge.LogLevelDebug) {
-				h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "malformed connect request", map[string]interface{}{"error": err.Error()}))
+				h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "malformed connect request", map[string]any{"error": err.Error()}))
 			}
 			return
 		}
@@ -55,53 +57,20 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	protoVersion := h.config.ProtocolVersion
-	if r.URL.RawQuery != "" {
-		query := r.URL.Query()
-		if queryProtocolVersion := query.Get("cf_protocol_version"); queryProtocolVersion != "" {
-			switch queryProtocolVersion {
-			case "v1":
-				protoVersion = centrifuge.ProtocolVersion1
-			case "v2":
-				protoVersion = centrifuge.ProtocolVersion2
-			default:
-				h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "unknown protocol version", map[string]interface{}{"transport": transportName, "version": queryProtocolVersion}))
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-		}
-	}
-
-	transport := newStreamTransport(r, protoVersion, h.config.PingPongConfig)
+	transport := newStreamTransport(r, h.config.PingPongConfig)
 	c, closeFn, err := centrifuge.NewClient(r.Context(), h.node, transport)
 	if err != nil {
-		h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error create client", map[string]interface{}{"error": err.Error(), "transport": "uni_http_stream"}))
+		h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error create client", map[string]any{"error": err.Error(), "transport": "uni_http_stream"}))
 		return
 	}
 	defer func() { _ = closeFn() }()
 	defer close(transport.closedCh) // need to execute this after client closeFn.
 
 	if h.node.LogEnabled(centrifuge.LogLevelDebug) {
-		h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]interface{}{"transport": transport.Name(), "client": c.ID()}))
+		h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]any{"transport": transport.Name(), "client": c.ID()}))
 		defer func(started time.Time) {
-			h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]interface{}{"duration": time.Since(started), "transport": transport.Name(), "client": c.ID()}))
+			h.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]any{"duration": time.Since(started).String(), "transport": transport.Name(), "client": c.ID()}))
 		}(time.Now())
-	}
-
-	if r.ProtoMajor == 1 {
-		// An endpoint MUST NOT generate an HTTP/2 message containing connection-specific header fields.
-		// Source: RFC7540.
-		w.Header().Set("Connection", "keep-alive")
-	}
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expire", "0")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return
 	}
 
 	connectRequest := centrifuge.ConnectRequest{
@@ -122,62 +91,61 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		connectRequest.Subs = subs
 	}
 
-	c.Connect(connectRequest)
-
-	if protoVersion == centrifuge.ProtocolVersion1 {
-		pingInterval := 25 * time.Second
-		tick := time.NewTicker(pingInterval)
-		defer tick.Stop()
-
-		for {
-			select {
-			case <-r.Context().Done():
+	if h.config.ConnectCodeToHTTPStatus.Enabled {
+		err = c.ConnectNoErrorToDisconnect(connectRequest)
+		if err != nil {
+			resp, ok := tools.ConnectErrorToToHTTPResponse(err, h.config.ConnectCodeToHTTPStatus.Transforms)
+			if ok {
+				w.WriteHeader(resp.Status)
+				_, _ = w.Write([]byte(resp.Body))
 				return
-			case <-transport.disconnectCh:
-				return
-			case <-tick.C:
-				_, err = w.Write([]byte("null\n"))
-				if err != nil {
-					return
-				}
-				flusher.Flush()
-			case data, ok := <-transport.messages:
-				if !ok {
-					return
-				}
-				tick.Reset(pingInterval)
-				_, err = w.Write(data)
-				if err != nil {
-					return
-				}
-				_, err = w.Write([]byte("\n"))
-				if err != nil {
-					return
-				}
-				flusher.Flush()
 			}
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+			return
 		}
 	} else {
-		for {
-			select {
-			case <-r.Context().Done():
+		c.Connect(connectRequest)
+	}
+
+	if r.ProtoMajor == 1 {
+		// An endpoint MUST NOT generate an HTTP/2 message containing connection-specific header fields.
+		// Source: RFC7540.
+		w.Header().Set("Connection", "keep-alive")
+	}
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expire", "0")
+	w.WriteHeader(http.StatusOK)
+
+	_, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	rc := http.NewResponseController(w)
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-transport.disconnectCh:
+			return
+		case data, ok := <-transport.messages:
+			if !ok {
 				return
-			case <-transport.disconnectCh:
-				return
-			case data, ok := <-transport.messages:
-				if !ok {
-					return
-				}
-				_, err = w.Write(data)
-				if err != nil {
-					return
-				}
-				_, err = w.Write([]byte("\n"))
-				if err != nil {
-					return
-				}
-				flusher.Flush()
 			}
+			_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+			_, err = w.Write(data)
+			if err != nil {
+				return
+			}
+			_, err = w.Write([]byte("\n"))
+			if err != nil {
+				return
+			}
+			_ = rc.Flush()
 		}
 	}
 }

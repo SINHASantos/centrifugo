@@ -1,14 +1,12 @@
 package unigrpc
 
 import (
-	"errors"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/unigrpc/unistream"
+	"github.com/centrifugal/centrifugo/v5/internal/unigrpc/unistream"
 
 	"github.com/centrifugal/centrifuge"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
 
 // RegisterService ...
@@ -26,9 +24,6 @@ type Service struct {
 
 // NewService creates new Service.
 func NewService(n *centrifuge.Node, c Config) *Service {
-	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = centrifuge.ProtocolVersion1
-	}
 	return &Service{
 		config: c,
 		node:   n,
@@ -37,27 +32,8 @@ func NewService(n *centrifuge.Node, c Config) *Service {
 
 // Consume is a unidirectional server->client stream with real-time data.
 func (s *Service) Consume(req *unistream.ConnectRequest, stream unistream.CentrifugoUniStream_ConsumeServer) error {
-	protoVersion := s.config.ProtocolVersion
-	if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
-		mdProtocolVersion := md.Get("x-cf-protocol-version")
-		if len(mdProtocolVersion) == 1 {
-			queryProtocolVersion := mdProtocolVersion[0]
-			if queryProtocolVersion != "" {
-				switch queryProtocolVersion {
-				case "v1":
-					protoVersion = centrifuge.ProtocolVersion1
-				case "v2":
-					protoVersion = centrifuge.ProtocolVersion2
-				default:
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "unknown protocol version", map[string]interface{}{"transport": transportName, "version": queryProtocolVersion}))
-					return errors.New("unknown protocol version")
-				}
-			}
-		}
-	}
-
 	streamDataCh := make(chan rawFrame)
-	transport := newGRPCTransport(stream, streamDataCh, protoVersion)
+	transport := newGRPCTransport(stream, streamDataCh)
 
 	connectRequest := centrifuge.ConnectRequest{
 		Token:   req.Token,
@@ -84,9 +60,9 @@ func (s *Service) Consume(req *unistream.ConnectRequest, stream unistream.Centri
 	defer func() { _ = closeFn() }()
 
 	if s.node.LogEnabled(centrifuge.LogLevelDebug) {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]interface{}{"transport": transport.Name(), "client": c.ID()}))
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]any{"transport": transport.Name(), "client": c.ID()}))
 		defer func(started time.Time) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]interface{}{"duration": time.Since(started), "transport": transport.Name(), "client": c.ID()}))
+			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]any{"duration": time.Since(started).String(), "transport": transport.Name(), "client": c.ID()}))
 		}(time.Now())
 	}
 

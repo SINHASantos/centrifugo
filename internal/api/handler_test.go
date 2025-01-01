@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
 
 	"github.com/stretchr/testify/require"
 )
@@ -20,10 +20,16 @@ func TestAPIHandler(t *testing.T) {
 	ruleConfig := rule.DefaultConfig
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
-	apiExecutor := NewExecutor(n, ruleContainer, &testSurveyCaller{}, "test")
+	apiExecutor := NewExecutor(n, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 
 	mux := http.NewServeMux()
-	mux.Handle("/api", NewHandler(n, apiExecutor, Config{}))
+	apiHandler := NewHandler(n, apiExecutor, Config{})
+	mux.Handle("/api", apiHandler.OldRoute())
+	for path, handler := range apiHandler.Routes() {
+		handlePath := "/api" + path
+		mux.Handle(handlePath, handler)
+	}
+
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -47,6 +53,14 @@ func TestAPIHandler(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, resp.StatusCode, http.StatusOK)
 
+	// valid JSON request to special method route
+	data = `{"channel": "test", "data":{}}`
+	req, _ = http.NewRequest("POST", server.URL+"/api/publish", bytes.NewBuffer([]byte(data)))
+	req.Header.Add("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, resp.StatusCode, http.StatusOK)
+
 	// request with unknown method.
 	data = `{"method":"unknown","params":{"channel": "test", "data":{}}}`
 	req, _ = http.NewRequest("POST", server.URL+"/api", bytes.NewBuffer([]byte(data)))
@@ -65,7 +79,10 @@ func BenchmarkAPIHandler(b *testing.B) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(b, err)
 
-	handler := NewHandler(n, NewExecutor(n, ruleContainer, nil, "http"), Config{})
+	handler := NewHandler(n, NewExecutor(n, ruleContainer, nil, ExecutorConfig{
+		Protocol:         "http",
+		UseOpenTelemetry: false,
+	}), Config{})
 
 	payload := []byte(`{"method": "publish", "params": {"channel": "index", "data": 1}}`)
 
@@ -75,7 +92,7 @@ func BenchmarkAPIHandler(b *testing.B) {
 		for pb.Next() {
 			request, _ := http.NewRequest(http.MethodPost, "/api", bytes.NewReader(payload))
 			recorder := httptest.NewRecorder()
-			handler.ServeHTTP(recorder, request)
+			handler.handlePublish(recorder, request)
 			if recorder.Code != http.StatusOK {
 				b.Fatalf("unexpected status code %d", recorder.Code)
 			}

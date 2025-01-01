@@ -4,21 +4,21 @@ import (
 	"context"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v5/internal/proxyproto"
 )
 
 // HTTPConnectProxy ...
 type HTTPConnectProxy struct {
-	proxy      Proxy
+	config     Config
 	httpCaller HTTPCaller
 }
 
 var _ ConnectProxy = (*HTTPConnectProxy)(nil)
 
 // NewHTTPConnectProxy ...
-func NewHTTPConnectProxy(p Proxy) (*HTTPConnectProxy, error) {
+func NewHTTPConnectProxy(p Config) (*HTTPConnectProxy, error) {
 	return &HTTPConnectProxy{
-		proxy:      p,
+		config:     p,
 		httpCaller: NewHTTPCaller(proxyHTTPClient(time.Duration(p.Timeout))),
 	}, nil
 }
@@ -30,7 +30,7 @@ func (p *HTTPConnectProxy) Protocol() string {
 
 // UseBase64 ...
 func (p *HTTPConnectProxy) UseBase64() bool {
-	return p.proxy.BinaryEncoding
+	return p.config.BinaryEncoding
 }
 
 // ProxyConnect proxies connect control to application backend.
@@ -39,8 +39,15 @@ func (p *HTTPConnectProxy) ProxyConnect(ctx context.Context, req *proxyproto.Con
 	if err != nil {
 		return nil, err
 	}
-	respData, err := p.httpCaller.CallHTTP(ctx, p.proxy.Endpoint, httpRequestHeaders(ctx, p.proxy), data)
+	respData, err := p.httpCaller.CallHTTP(ctx, p.config.Endpoint, httpRequestHeaders(ctx, p.config), data)
 	if err != nil {
+		protocolError, protocolDisconnect := transformHTTPStatusError(err, p.config.HttpStatusTransforms)
+		if protocolError != nil || protocolDisconnect != nil {
+			return &proxyproto.ConnectResponse{
+				Error:      protocolError,
+				Disconnect: protocolDisconnect,
+			}, nil
+		}
 		return nil, err
 	}
 	return httpDecoder.DecodeConnectResponse(respData)

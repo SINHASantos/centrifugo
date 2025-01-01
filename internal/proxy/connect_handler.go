@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/clientcontext"
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
-	"github.com/centrifugal/centrifugo/v4/internal/subsource"
+	"github.com/centrifugal/centrifugo/v5/internal/clientstorage"
+	"github.com/centrifugal/centrifugo/v5/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/subsource"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/prometheus/client_golang/prometheus"
@@ -76,8 +76,8 @@ func (h *ConnectHandler) Handle(node *centrifuge.Node) ConnectingHandlerFunc {
 			h.summary.Observe(duration)
 			h.histogram.Observe(duration)
 			h.errors.Inc()
-			node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error proxying connect", map[string]interface{}{"client": e.ClientID, "error": err.Error()}))
-			return centrifuge.ConnectReply{}, ConnectExtra{}, centrifuge.ErrorInternal
+			node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error proxying connect", map[string]any{"client": e.ClientID, "error": err.Error()}))
+			return centrifuge.ConnectReply{}, ConnectExtra{}, err
 		}
 		h.summary.Observe(duration)
 		h.histogram.Observe(duration)
@@ -97,7 +97,7 @@ func (h *ConnectHandler) Handle(node *centrifuge.Node) ConnectingHandlerFunc {
 		if result.B64Info != "" {
 			decodedInfo, err := base64.StdEncoding.DecodeString(result.B64Info)
 			if err != nil {
-				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 info", map[string]interface{}{"client": e.ClientID, "error": err.Error()}))
+				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 info", map[string]any{"client": e.ClientID, "error": err.Error()}))
 				return centrifuge.ConnectReply{}, ConnectExtra{}, centrifuge.ErrorInternal
 			}
 			info = decodedInfo
@@ -109,7 +109,7 @@ func (h *ConnectHandler) Handle(node *centrifuge.Node) ConnectingHandlerFunc {
 		if result.B64Data != "" {
 			decodedData, err := base64.StdEncoding.DecodeString(result.B64Data)
 			if err != nil {
-				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 data", map[string]interface{}{"client": e.ClientID, "error": err.Error()}))
+				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding base64 data", map[string]any{"client": e.ClientID, "error": err.Error()}))
 				return centrifuge.ConnectReply{}, ConnectExtra{}, centrifuge.ErrorInternal
 			}
 			data = decodedData
@@ -128,31 +128,103 @@ func (h *ConnectHandler) Handle(node *centrifuge.Node) ConnectingHandlerFunc {
 			reply.Data = data
 		}
 		if len(result.Channels) > 0 {
-			subscriptions := make(map[string]centrifuge.SubscribeOptions, len(result.Channels))
+			if reply.Subscriptions == nil {
+				reply.Subscriptions = make(map[string]centrifuge.SubscribeOptions, len(result.Channels))
+			}
 			for _, ch := range result.Channels {
 				_, _, chOpts, found, err := h.ruleContainer.ChannelOptions(ch)
 				if err != nil {
 					return centrifuge.ConnectReply{}, ConnectExtra{}, err
 				}
 				if !found {
+					node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "unknown channel in connect result channels", map[string]any{"client": e.ClientID, "channel": ch}))
 					return centrifuge.ConnectReply{}, ConnectExtra{}, centrifuge.ErrorUnknownChannel
 				}
-				subscriptions[ch] = centrifuge.SubscribeOptions{
+				reply.Subscriptions[ch] = centrifuge.SubscribeOptions{
 					EmitPresence:      chOpts.Presence,
 					EmitJoinLeave:     chOpts.JoinLeave,
 					PushJoinLeave:     chOpts.ForcePushJoinLeave,
 					EnableRecovery:    chOpts.ForceRecovery,
 					EnablePositioning: chOpts.ForcePositioning,
+					RecoveryMode:      chOpts.GetRecoveryMode(),
 					Source:            subsource.ConnectProxy,
+					HistoryMetaTTL:    time.Duration(chOpts.HistoryMetaTTL),
 				}
 			}
-			reply.Subscriptions = subscriptions
 		}
+		if len(result.Subs) > 0 {
+			if reply.Subscriptions == nil {
+				reply.Subscriptions = make(map[string]centrifuge.SubscribeOptions, len(result.Subs))
+			}
+			for ch, options := range result.Subs {
+				_, _, chOpts, found, err := h.ruleContainer.ChannelOptions(ch)
+				if err != nil {
+					return centrifuge.ConnectReply{}, ConnectExtra{}, err
+				}
+				if !found {
+					node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "unknown channel in connect result subs", map[string]any{"client": e.ClientID, "channel": ch}))
+					return centrifuge.ConnectReply{}, ConnectExtra{}, centrifuge.ErrorUnknownChannel
+				}
+				var chInfo []byte
+				if options.B64Info != "" {
+					byteInfo, err := base64.StdEncoding.DecodeString(options.B64Info)
+					if err != nil {
+						return centrifuge.ConnectReply{}, ConnectExtra{}, err
+					}
+					chInfo = byteInfo
+				} else {
+					chInfo = options.Info
+				}
+				var chData []byte
+				if options.B64Data != "" {
+					byteInfo, err := base64.StdEncoding.DecodeString(options.B64Data)
+					if err != nil {
+						return centrifuge.ConnectReply{}, ConnectExtra{}, err
+					}
+					chData = byteInfo
+				} else {
+					chData = options.Data
+				}
+				presence := chOpts.Presence
+				if options.Override != nil && options.Override.Presence != nil {
+					presence = options.Override.Presence.Value
+				}
+				joinLeave := chOpts.JoinLeave
+				if options.Override != nil && options.Override.JoinLeave != nil {
+					joinLeave = options.Override.JoinLeave.Value
+				}
+				pushJoinLeave := chOpts.ForcePushJoinLeave
+				if options.Override != nil && options.Override.ForcePushJoinLeave != nil {
+					pushJoinLeave = options.Override.ForcePushJoinLeave.Value
+				}
+				recovery := chOpts.ForceRecovery
+				if options.Override != nil && options.Override.ForceRecovery != nil {
+					recovery = options.Override.ForceRecovery.Value
+				}
+				positioning := chOpts.ForcePositioning
+				if options.Override != nil && options.Override.ForcePositioning != nil {
+					positioning = options.Override.ForcePositioning.Value
+				}
+				recoveryMode := chOpts.GetRecoveryMode()
+				reply.Subscriptions[ch] = centrifuge.SubscribeOptions{
+					ChannelInfo:       chInfo,
+					EmitPresence:      presence,
+					EmitJoinLeave:     joinLeave,
+					PushJoinLeave:     pushJoinLeave,
+					EnableRecovery:    recovery,
+					EnablePositioning: positioning,
+					RecoveryMode:      recoveryMode,
+					Data:              chData,
+					Source:            subsource.ConnectProxy,
+					HistoryMetaTTL:    time.Duration(chOpts.HistoryMetaTTL),
+				}
+			}
+		}
+
 		if result.Meta != nil {
-			newCtx := clientcontext.SetContextConnectionMeta(ctx, clientcontext.ConnectionMeta{
-				Meta: json.RawMessage(result.Meta),
-			})
-			reply.Context = newCtx
+			reply.Storage = map[string]any{
+				clientstorage.KeyMeta: json.RawMessage(result.Meta),
+			}
 		}
 
 		return reply, ConnectExtra{}, nil

@@ -7,30 +7,24 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/http3"
-
-	"github.com/rs/zerolog"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/rs/zerolog/log"
 )
 
 // LogRequest middleware logs details of request.
 func LogRequest(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if zerolog.GlobalLevel() <= zerolog.DebugLevel {
-			start := time.Now()
-			lrw := &logResponseWriter{w, 0}
-			h.ServeHTTP(lrw, r)
-			addr := r.Header.Get("X-Real-IP")
+		start := time.Now()
+		lrw := &logResponseWriter{w, 0}
+		h.ServeHTTP(lrw, r)
+		addr := r.Header.Get("X-Real-IP")
+		if addr == "" {
+			addr = r.Header.Get("X-Forwarded-For")
 			if addr == "" {
-				addr = r.Header.Get("X-Forwarded-For")
-				if addr == "" {
-					addr = r.RemoteAddr
-				}
+				addr = r.RemoteAddr
 			}
-			log.Debug().Str("method", r.Method).Int("status", lrw.Status()).Str("path", r.URL.Path).Str("addr", addr).Str("duration", time.Since(start).String()).Msg("http request")
-		} else {
-			h.ServeHTTP(w, r)
 		}
+		log.Debug().Str("method", r.Method).Int("status", lrw.Status()).Str("path", r.URL.Path).Str("addr", addr).Str("duration", time.Since(start).String()).Msg("http request")
 	})
 }
 
@@ -68,12 +62,18 @@ func (lrw *logResponseWriter) Flush() {
 	lrw.ResponseWriter.(http.Flusher).Flush()
 }
 
-// StreamCreator for WebTransport.
-func (lrw *logResponseWriter) StreamCreator() http3.StreamCreator {
-	return lrw.ResponseWriter.(http3.Hijacker).StreamCreator()
+// Connection for WebTransport.
+func (lrw *logResponseWriter) Connection() http3.Connection {
+	return lrw.ResponseWriter.(http3.Hijacker).Connection()
+}
+
+// HTTPStream for WebTransport.
+func (lrw *logResponseWriter) HTTPStream() http3.Stream {
+	return lrw.ResponseWriter.(http3.HTTPStreamer).HTTPStream()
 }
 
 // CloseNotify as SockJS uses http.CloseNotifier.
+//
 //goland:noinspection GoDeprecation
 func (lrw *logResponseWriter) CloseNotify() <-chan bool {
 	//nolint:staticcheck

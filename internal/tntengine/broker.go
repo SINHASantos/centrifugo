@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/tools"
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
 
 	"github.com/FZambia/tarantool"
 	"github.com/centrifugal/centrifuge"
@@ -42,11 +42,6 @@ var _ centrifuge.Broker = (*Broker)(nil)
 
 // BrokerConfig is a config for Tarantool Broker.
 type BrokerConfig struct {
-	// HistoryMetaTTL sets a time of stream meta key expiration in Tarantool. Stream
-	// meta key is a Tarantool HASH that contains top offset in channel and epoch value.
-	// By default stream meta keys do not expire.
-	HistoryMetaTTL time.Duration
-
 	// UsePolling allows to turn on polling mode instead of push.
 	UsePolling bool
 
@@ -143,32 +138,41 @@ func (m *pubResponse) DecodeMsgpack(d *msgpack.Decoder) error {
 }
 
 // Publish - see centrifuge.Broker interface description.
-func (b *Broker) Publish(ch string, data []byte, opts centrifuge.PublishOptions) (centrifuge.StreamPosition, error) {
+func (b *Broker) Publish(ch string, data []byte, opts centrifuge.PublishOptions) (centrifuge.StreamPosition, bool, error) {
 	s := consistentShard(ch, b.shards)
 
 	protoPub := &protocol.Publication{
-		Data: data,
-		Info: infoToProto(opts.ClientInfo),
-		Tags: opts.Tags,
+		Data:  data,
+		Info:  infoToProto(opts.ClientInfo),
+		Tags:  opts.Tags,
+		Delta: opts.UseDelta, // Will be cleaned up before passing to Node.
+		Time:  time.Now().UnixMilli(),
 	}
 	byteMessage, err := protoPub.MarshalVT()
 	if err != nil {
-		return centrifuge.StreamPosition{}, err
+		return centrifuge.StreamPosition{}, false, err
 	}
+
+	historyMetaTTL := opts.HistoryMetaTTL
+	if historyMetaTTL == 0 {
+		historyMetaTTL = b.node.Config().HistoryMetaTTL
+	}
+	historyMetaTTLSeconds := int(historyMetaTTL.Seconds())
+
 	pr := &pubRequest{
 		MsgType:        "p",
 		Channel:        ch,
 		Data:           string(byteMessage),
 		HistoryTTL:     int(opts.HistoryTTL.Seconds()),
 		HistorySize:    opts.HistorySize,
-		HistoryMetaTTL: int(b.config.HistoryMetaTTL.Seconds()),
+		HistoryMetaTTL: historyMetaTTLSeconds,
 	}
 	var resp pubResponse
 	err = s.ExecTyped(tarantool.Call("centrifuge.publish", pr), &resp)
 	if err != nil {
-		return centrifuge.StreamPosition{}, err
+		return centrifuge.StreamPosition{}, false, err
 	}
-	return centrifuge.StreamPosition{Offset: resp.Offset, Epoch: resp.Epoch}, err
+	return centrifuge.StreamPosition{Offset: resp.Offset, Epoch: resp.Epoch}, false, err
 }
 
 // PublishJoin - see centrifuge.Broker interface description.
@@ -240,7 +244,7 @@ func (b *Broker) Subscribe(ch string) error {
 		return centrifuge.ErrorBadRequest
 	}
 	if b.node.LogEnabled(centrifuge.LogLevelDebug) {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "subscribe node on channel", map[string]interface{}{"channel": ch}))
+		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "subscribe node on channel", map[string]any{"channel": ch}))
 	}
 	r := newSubRequest([]string{ch}, true)
 	s := b.shards[consistentIndex(ch, len(b.shards))]
@@ -250,7 +254,7 @@ func (b *Broker) Subscribe(ch string) error {
 // Unsubscribe - see centrifuge.Broker interface description.
 func (b *Broker) Unsubscribe(ch string) error {
 	if b.node.LogEnabled(centrifuge.LogLevelDebug) {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "unsubscribe node from channel", map[string]interface{}{"channel": ch}))
+		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "unsubscribe node from channel", map[string]any{"channel": ch}))
 	}
 	r := newSubRequest([]string{ch}, false)
 	s := b.shards[consistentIndex(ch, len(b.shards))]
@@ -363,7 +367,8 @@ func pubFromProto(pub *protocol.Publication) *centrifuge.Publication {
 }
 
 // History - see centrifuge.Broker interface description.
-func (b *Broker) History(ch string, filter centrifuge.HistoryFilter) ([]*centrifuge.Publication, centrifuge.StreamPosition, error) {
+func (b *Broker) History(ch string, opts centrifuge.HistoryOptions) ([]*centrifuge.Publication, centrifuge.StreamPosition, error) {
+	filter := opts.Filter
 	var includePubs = true
 	var offset uint64
 	if filter.Since != nil {
@@ -383,7 +388,13 @@ func (b *Broker) History(ch string, filter centrifuge.HistoryFilter) ([]*centrif
 	if filter.Limit > 0 {
 		limit = filter.Limit
 	}
-	historyMetaTTLSeconds := int(b.config.HistoryMetaTTL.Seconds())
+
+	historyMetaTTL := opts.MetaTTL
+	if historyMetaTTL == 0 {
+		historyMetaTTL = b.node.Config().HistoryMetaTTL
+	}
+	historyMetaTTLSeconds := int(historyMetaTTL.Seconds())
+
 	s := consistentShard(ch, b.shards)
 	req := historyRequest{
 		Channel:        ch,
@@ -479,7 +490,7 @@ func (m *pubSubMessage) DecodeMsgpack(d *msgpack.Decoder) error {
 
 func (b *Broker) runPubSub(s *Shard, eventHandler centrifuge.BrokerEventHandler) {
 	logError := func(errString string) {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "restart pub/sub", map[string]interface{}{"error": errString}))
+		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "restart pub/sub", map[string]any{"error": errString}))
 	}
 
 	u, err := uuid.NewRandom()
@@ -613,7 +624,7 @@ func (b *Broker) runPubSub(s *Shard, eventHandler centrifuge.BrokerEventHandler)
 				case n := <-ch:
 					err := b.handleMessage(eventHandler, n)
 					if err != nil {
-						b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error handling client message", map[string]interface{}{"error": err.Error()}))
+						b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error handling client message", map[string]any{"error": err.Error()}))
 						continue
 					}
 				}
@@ -638,7 +649,7 @@ func (b *Broker) runPubSub(s *Shard, eventHandler centrifuge.BrokerEventHandler)
 				r := newSubRequest(batch, true)
 				err := b.sendSubscribe(s, r)
 				if err != nil {
-					b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error subscribing", map[string]interface{}{"error": err.Error()}))
+					b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error subscribing", map[string]any{"error": err.Error()}))
 					closeDoneOnce()
 					return
 				}
@@ -650,7 +661,7 @@ func (b *Broker) runPubSub(s *Shard, eventHandler centrifuge.BrokerEventHandler)
 			r := newSubRequest(batch, true)
 			err := b.sendSubscribe(s, r)
 			if err != nil {
-				b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error subscribing", map[string]interface{}{"error": err.Error()}))
+				b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error subscribing", map[string]any{"error": err.Error()}))
 				closeDoneOnce()
 				return
 			}
@@ -681,10 +692,10 @@ func (b *Broker) waitPubSubMessages(conn *tarantool.Connection, connID string, c
 		_, err := conn.ExecContext(ctx, tarantool.Call(
 			"centrifuge.get_messages",
 			pollRequest{ConnID: connID, UsePolling: b.config.UsePolling, Timeout: 25},
-		).WithPushTyped(func(decode func(interface{}) error) {
+		).WithPushTyped(func(decode func(any) error) {
 			var m [][]pubSubMessage
 			if err := decode(&m); err != nil {
-				b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding push", map[string]interface{}{"error": err.Error()}))
+				b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error decoding push", map[string]any{"error": err.Error()}))
 				return
 			}
 			if len(m) == 1 {
@@ -717,9 +728,14 @@ func (b *Broker) handleMessage(eventHandler centrifuge.BrokerEventHandler, msg p
 		var pub protocol.Publication
 		err := pub.UnmarshalVT(msg.Data)
 		if err == nil {
+			delta := pub.Delta
+			pub.Delta = false
 			publication := pubFromProto(&pub)
 			publication.Offset = msg.Offset
-			_ = eventHandler.HandlePublication(msg.Channel, publication, centrifuge.StreamPosition{Offset: msg.Offset, Epoch: msg.Epoch})
+			_ = eventHandler.HandlePublication(
+				msg.Channel, publication,
+				centrifuge.StreamPosition{Offset: msg.Offset, Epoch: msg.Epoch},
+				delta, nil)
 		}
 	case "j":
 		var info protocol.ClientInfo
@@ -739,7 +755,7 @@ func (b *Broker) handleMessage(eventHandler centrifuge.BrokerEventHandler, msg p
 
 func (b *Broker) runControlPubSub(s *Shard, eventHandler centrifuge.BrokerEventHandler) {
 	logError := func(errString string) {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "restart control pub/sub", map[string]interface{}{"error": errString}))
+		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "restart control pub/sub", map[string]any{"error": errString}))
 	}
 
 	u, err := uuid.NewRandom()
@@ -792,7 +808,7 @@ func (b *Broker) runControlPubSub(s *Shard, eventHandler centrifuge.BrokerEventH
 				case n := <-workCh:
 					err := eventHandler.HandleControl(n.Data)
 					if err != nil {
-						b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error handling control message", map[string]interface{}{"error": err.Error()}))
+						b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error handling control message", map[string]any{"error": err.Error()}))
 						continue
 					}
 				}

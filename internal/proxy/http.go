@@ -3,13 +3,14 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v5/internal/proxyproto"
 )
 
 type baseRequestHTTP struct {
@@ -80,9 +81,12 @@ func (c *httpCaller) CallHTTP(ctx context.Context, endpoint string, header http.
 	return respData, nil
 }
 
-func getProxyHeader(allHeader http.Header, extraHeaders []string) http.Header {
+func getProxyHeader(allHeader http.Header, allowedHeaders []string, staticHeaders map[string]string) http.Header {
 	proxyHeader := http.Header{}
-	copyHeader(proxyHeader, allHeader, extraHeaders)
+	for k, v := range staticHeaders {
+		proxyHeader.Set(k, v)
+	}
+	copyHeader(proxyHeader, allHeader, allowedHeaders)
 	proxyHeader.Set("Content-Type", "application/json")
 	return proxyHeader
 }
@@ -103,4 +107,32 @@ func stringInSlice(a string, list []string) bool {
 		}
 	}
 	return false
+}
+
+func transformHTTPStatusError(err error, transforms []HttpStatusToCodeTransform) (*proxyproto.Error, *proxyproto.Disconnect) {
+	if len(transforms) == 0 {
+		return nil, nil
+	}
+	var statusErr *statusCodeError
+	if !errors.As(err, &statusErr) {
+		return nil, nil
+	}
+	for _, t := range transforms {
+		if t.StatusCode == statusErr.Code {
+			if t.ToError.Code > 0 {
+				return &proxyproto.Error{
+					Code:      t.ToError.Code,
+					Message:   t.ToError.Message,
+					Temporary: t.ToError.Temporary,
+				}, nil
+			}
+			if t.ToDisconnect.Code > 0 {
+				return nil, &proxyproto.Disconnect{
+					Code:   t.ToDisconnect.Code,
+					Reason: t.ToDisconnect.Reason,
+				}
+			}
+		}
+	}
+	return nil, nil
 }

@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
-	"github.com/centrifugal/centrifugo/v4/internal/tools"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type grpcConnHandleTestCase struct {
@@ -22,9 +24,11 @@ type grpcConnHandleTestCase struct {
 	connectProxyHandler *ConnectHandler
 }
 
-func getTestGrpcProxy(commonProxyTestCase *tools.CommonGRPCProxyTestCase) Proxy {
-	return Proxy{
-		Endpoint: commonProxyTestCase.Listener.Addr().String(),
+func getTestGrpcProxy(commonProxyTestCase *tools.CommonGRPCProxyTestCase) Config {
+	return Config{
+		// Using passthrough is required for in-memory bufconn since grpc-go v1.63.0.
+		// See https://github.com/grpc/grpc-go/issues/7091.
+		Endpoint: "passthrough:///" + commonProxyTestCase.Listener.Addr().String(),
 		Timeout:  tools.Duration(5 * time.Second),
 		testGrpcDialer: func(ctx context.Context, s string) (net.Conn, error) {
 			return commonProxyTestCase.Listener.Dial()
@@ -32,10 +36,16 @@ func getTestGrpcProxy(commonProxyTestCase *tools.CommonGRPCProxyTestCase) Proxy 
 	}
 }
 
-func getTestHttpProxy(commonProxyTestCase *tools.CommonHTTPProxyTestCase, endpoint string) Proxy {
-	return Proxy{
+func getTestHttpProxy(commonProxyTestCase *tools.CommonHTTPProxyTestCase, endpoint string) Config {
+	return Config{
 		Endpoint: commonProxyTestCase.Server.URL + endpoint,
 		Timeout:  tools.Duration(5 * time.Second),
+		StaticHttpHeaders: map[string]string{
+			"X-Test": "test",
+		},
+		HttpStatusTransforms: []HttpStatusToCodeTransform{
+			{StatusCode: 404, ToDisconnect: TransformDisconnect{Code: 4504, Reason: "not found"}},
+		},
 	}
 }
 
@@ -122,6 +132,7 @@ func TestHandleConnectWithEmptyReply(t *testing.T) {
 
 	httpTestCase := newConnHandleHTTPTestCase(context.Background(), "/proxy")
 	httpTestCase.Mux.HandleFunc("/proxy", func(w http.ResponseWriter, req *http.Request) {
+		require.Equal(t, "test", req.Header.Get("X-Test"))
 		_, _ = w.Write([]byte(`{}`))
 	})
 	defer httpTestCase.Teardown()
@@ -221,7 +232,13 @@ func TestHandleConnectWithoutProxyServerStart(t *testing.T) {
 	cases := newConnHandleTestCases(httpTestCase, grpcTestCase)
 	for _, c := range cases {
 		reply, err := c.invokeHandle(context.Background())
-		require.ErrorIs(t, centrifuge.ErrorInternal, err, c.protocol)
+		if c.protocol == "grpc" {
+			st, ok := status.FromError(err)
+			require.True(t, ok, c.protocol)
+			require.Equal(t, codes.Unavailable, st.Code(), c.protocol)
+		} else {
+			require.Error(t, err, c.protocol)
+		}
 		require.Equal(t, centrifuge.ConnectReply{}, reply, c.protocol)
 	}
 }
@@ -239,9 +256,8 @@ func TestHandleConnectWithProxyServerCustomDisconnect(t *testing.T) {
 	cases := newConnHandleTestCases(httpTestCase, grpcTestCase)
 	for _, c := range cases {
 		expectedErr := centrifuge.Disconnect{
-			Code:      4000,
-			Reason:    "custom disconnect",
-			Reconnect: false,
+			Code:   4000,
+			Reason: "custom disconnect",
 		}
 
 		reply, err := c.invokeHandle(context.Background())
@@ -318,6 +334,35 @@ func TestHandleConnectWithSubscriptionError(t *testing.T) {
 	for _, c := range cases {
 		reply, err := c.invokeHandle(context.Background())
 		require.ErrorIs(t, centrifuge.ErrorUnknownChannel, err, c.protocol)
+		require.Equal(t, centrifuge.ConnectReply{}, reply, c.protocol)
+	}
+}
+
+func TestHandleConnectWithHTTPCodeTransform(t *testing.T) {
+	grpcTestCase := newConnHandleGRPCTestCase(context.Background(), newProxyGRPCTestServer("http status code transform", proxyGRPCTestServerOptions{}))
+	defer grpcTestCase.Teardown()
+
+	httpTestCase := newConnHandleHTTPTestCase(context.Background(), "/proxy")
+	httpTestCase.Mux.HandleFunc("/proxy", func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	defer httpTestCase.Teardown()
+
+	cases := newConnHandleTestCases(httpTestCase, grpcTestCase)
+	for _, c := range cases {
+		if c.protocol == "grpc" {
+			continue // Transforms not supported.
+		}
+
+		expectedErr := centrifuge.Disconnect{
+			Code:   4504,
+			Reason: "not found",
+		}
+
+		reply, err := c.invokeHandle(context.Background())
+		require.NotNil(t, err, c.protocol)
+		require.Equal(t, expectedErr.Error(), err.Error(), c.protocol)
 		require.Equal(t, centrifuge.ConnectReply{}, reply, c.protocol)
 	}
 }

@@ -5,10 +5,11 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/centrifugal/centrifugo/v5/internal/apiproto"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
+	"github.com/centrifugal/centrifugo/v5/internal/tools"
+
 	"github.com/centrifugal/centrifuge"
-	. "github.com/centrifugal/centrifugo/v4/internal/apiproto"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
-	"github.com/centrifugal/centrifugo/v4/internal/tools"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,7 +42,7 @@ func TestPublishAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Publish(context.Background(), &PublishRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 
@@ -61,7 +62,7 @@ func TestBroadcastAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Broadcast(context.Background(), &BroadcastRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 
@@ -86,7 +87,7 @@ func TestHistoryAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.History(context.Background(), &HistoryRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 	resp = api.History(context.Background(), &HistoryRequest{Channel: "test"})
@@ -107,7 +108,7 @@ func TestHistoryRemoveAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.HistoryRemove(context.Background(), &HistoryRemoveRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 	resp = api.HistoryRemove(context.Background(), &HistoryRemoveRequest{Channel: "test"})
@@ -128,7 +129,7 @@ func TestPresenceAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Presence(context.Background(), &PresenceRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 	resp = api.Presence(context.Background(), &PresenceRequest{Channel: "test"})
@@ -149,7 +150,7 @@ func TestPresenceStatsAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.PresenceStats(context.Background(), &PresenceStatsRequest{})
 	require.Equal(t, ErrorBadRequest, resp.Error)
 	resp = api.PresenceStats(context.Background(), &PresenceStatsRequest{Channel: "test"})
@@ -169,7 +170,7 @@ func TestDisconnectAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Disconnect(context.Background(), &DisconnectRequest{
 		User: "test",
 	})
@@ -182,7 +183,7 @@ func TestUnsubscribeAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Unsubscribe(context.Background(), &UnsubscribeRequest{
 		User:    "test",
 		Channel: "test",
@@ -196,7 +197,7 @@ func TestRefreshAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Refresh(context.Background(), &RefreshRequest{
 		User: "test",
 	})
@@ -209,7 +210,7 @@ func TestSubscribeAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Subscribe(context.Background(), &SubscribeRequest{
 		User:    "test",
 		Channel: "test",
@@ -223,7 +224,7 @@ func TestInfoAPI(t *testing.T) {
 	ruleContainer, err := rule.NewContainer(ruleConfig)
 	require.NoError(t, err)
 
-	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, "test")
+	api := NewExecutor(node, ruleContainer, &testSurveyCaller{}, ExecutorConfig{Protocol: "test", UseOpenTelemetry: false})
 	resp := api.Info(context.Background(), &InfoRequest{})
 	require.Nil(t, resp.Error)
 }

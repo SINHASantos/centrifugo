@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/jwtverify"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
-	"github.com/cristalhq/jwt/v4"
+	"github.com/centrifugal/centrifugo/v5/internal/jwtverify"
+	"github.com/centrifugal/centrifugo/v5/internal/rule"
+	"github.com/cristalhq/jwt/v5"
+	"github.com/tidwall/sjson"
 )
 
 // GenerateToken generates sample JWT for user.
@@ -21,11 +22,28 @@ func GenerateToken(config jwtverify.VerifierConfig, user string, ttlSeconds int6
 		return "", fmt.Errorf("error creating HMAC signer: %w", err)
 	}
 	builder := jwt.NewBuilder(signer)
-	token, err := builder.Build(jwt.RegisteredClaims{
-		Subject:   user,
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(ttlSeconds) * time.Second)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-	})
+	claims := jwtverify.ConnectTokenClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+			Subject:  user,
+		},
+	}
+	if ttlSeconds > 0 {
+		claims.ExpiresAt = jwt.NewNumericDate(time.Now().Add(time.Duration(ttlSeconds) * time.Second))
+	}
+
+	encodedClaims, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	if config.UserIDClaim != "" {
+		encodedClaims, err = sjson.SetBytes(encodedClaims, config.UserIDClaim, user)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	token, err := builder.Build(encodedClaims)
 	if err != nil {
 		return "", err
 	}
@@ -42,16 +60,29 @@ func GenerateSubToken(config jwtverify.VerifierConfig, user string, channel stri
 		return "", fmt.Errorf("error creating HMAC signer: %w", err)
 	}
 	builder := jwt.NewBuilder(signer)
-	token, err := builder.Build(
-		jwtverify.SubscribeTokenClaims{
-			RegisteredClaims: jwt.RegisteredClaims{
-				Subject:   user,
-				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(ttlSeconds) * time.Second)),
-				IssuedAt:  jwt.NewNumericDate(time.Now()),
-			},
-			Channel: channel,
+	claims := jwtverify.SubscribeTokenClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+			Subject:  user,
 		},
-	)
+		Channel: channel,
+	}
+	if ttlSeconds > 0 {
+		claims.ExpiresAt = jwt.NewNumericDate(time.Now().Add(time.Duration(ttlSeconds) * time.Second))
+	}
+
+	encodedClaims, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	if config.UserIDClaim != "" {
+		encodedClaims, err = sjson.SetBytes(encodedClaims, config.UserIDClaim, user)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	token, err := builder.Build(encodedClaims)
 	if err != nil {
 		return "", err
 	}
@@ -63,8 +94,11 @@ func verify(config jwtverify.VerifierConfig, ruleConfig rule.Config, token strin
 	if err != nil {
 		return jwtverify.ConnectToken{}, err
 	}
-	verifier := jwtverify.NewTokenVerifierJWT(config, ruleContainer)
-	return verifier.VerifyConnectToken(token)
+	verifier, err := jwtverify.NewTokenVerifierJWT(config, ruleContainer)
+	if err != nil {
+		return jwtverify.ConnectToken{}, err
+	}
+	return verifier.VerifyConnectToken(token, false)
 }
 
 func verifySub(config jwtverify.VerifierConfig, ruleConfig rule.Config, token string) (jwtverify.SubscribeToken, error) {
@@ -72,8 +106,11 @@ func verifySub(config jwtverify.VerifierConfig, ruleConfig rule.Config, token st
 	if err != nil {
 		return jwtverify.SubscribeToken{}, err
 	}
-	verifier := jwtverify.NewTokenVerifierJWT(config, ruleContainer)
-	return verifier.VerifySubscribeToken(token)
+	verifier, err := jwtverify.NewTokenVerifierJWT(config, ruleContainer)
+	if err != nil {
+		return jwtverify.SubscribeToken{}, err
+	}
+	return verifier.VerifySubscribeToken(token, false)
 }
 
 // CheckToken checks JWT for user.

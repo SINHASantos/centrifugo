@@ -65,13 +65,13 @@ func (m *PresenceManager) Presence(ch string) (map[string]*centrifuge.ClientInfo
 	if len(result) == 0 {
 		return nil, errors.New("malformed presence result")
 	}
-	presenceInterfaceSlice, ok := result[0].([]interface{})
+	presenceInterfaceSlice, ok := result[0].([]any)
 	if !ok {
 		return nil, errors.New("malformed presence format: map expected")
 	}
 	presence := make(map[string]*centrifuge.ClientInfo, len(presenceInterfaceSlice))
 	for _, v := range presenceInterfaceSlice {
-		presenceRow, ok := v.([]interface{})
+		presenceRow, ok := v.([]any)
 		if !ok {
 			return nil, errors.New("malformed presence format: tuple expected")
 		}
@@ -172,7 +172,7 @@ type removePresenceRequest struct {
 	ClientID string
 }
 
-func (m *PresenceManager) RemovePresence(ch string, clientID string) error {
+func (m *PresenceManager) RemovePresence(ch string, clientID string, _ string) error {
 	s := consistentShard(ch, m.shards)
 	_, err := s.Exec(tarantool.Call("centrifuge.remove_presence", removePresenceRequest{Channel: ch, ClientID: clientID}))
 	return err
