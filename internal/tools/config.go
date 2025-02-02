@@ -2,20 +2,19 @@ package tools
 
 import (
 	"bytes"
-	"encoding/json"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/template"
-
-	"github.com/FZambia/viper-lite"
-	"github.com/google/uuid"
 )
 
-// pathExists returns whether the given file or directory exists or not
-func pathExists(path string) (bool, error) {
+// PathExists returns whether the given file or directory exists or not
+func PathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
@@ -27,31 +26,55 @@ func pathExists(path string) (bool, error) {
 }
 
 var jsonConfigTemplate = `{
-  "token_hmac_secret_key": "{{.TokenSecret}}",
-  "admin_password": "{{.AdminPassword}}",
-  "admin_secret": "{{.AdminSecret}}",
-  "api_key": "{{.APIKey}}",
-  "allowed_origins": []
+  "client": {
+    "token": {
+      "hmac_secret_key": "{{.TokenSecret}}"
+    },
+    "allowed_origins": []
+  },
+  "admin": {
+    "enabled": false,
+    "password": "{{.AdminPassword}}",
+    "secret": "{{.AdminSecret}}"
+  },
+  "http_api": {
+    "key": "{{.APIKey}}"
+  }
 }
 `
 
-var tomlConfigTemplate = `token_hmac_secret_key = "{{.TokenSecret}}"
-admin_password = "{{.AdminPassword}}"
-admin_secret = "{{.AdminSecret}}"
-api_key = "{{.APIKey}}"
-allowed_origins = []
+var tomlConfigTemplate = `[client]
+  allowed_origins = []
+
+  [client.token]
+    hmac_secret_key = "{{.TokenSecret}}"
+
+[admin]
+  enabled = false
+  password = "{{.AdminPassword}}"
+  secret = "{{.AdminSecret}}"
+
+[http_api]
+  key = "{{.APIKey}}"
 `
 
-var yamlConfigTemplate = `token_hmac_secret_key: {{.TokenSecret}}
-admin_password: {{.AdminPassword}}
-admin_secret: {{.AdminSecret}}
-api_key: {{.APIKey}}
-allowed_origins: []
+var yamlConfigTemplate = `client:
+  token:
+    hmac_secret_key: "{{.TokenSecret}}"
+  allowed_origins: []
+
+admin:
+  enabled: false
+  password: "{{.AdminPassword}}"
+  secret: "{{.AdminSecret}}"
+
+http_api:
+  key: "{{.APIKey}}"
 `
 
 // GenerateConfig generates configuration file at provided path.
 func GenerateConfig(f string) error {
-	exists, err := pathExists(f)
+	exists, err := PathExists(f)
 	if err != nil {
 		return err
 	}
@@ -89,35 +112,30 @@ func GenerateConfig(f string) error {
 		AdminSecret   string
 		APIKey        string
 	}{
-		uuid.New().String(),
-		uuid.New().String(),
-		uuid.New().String(),
-		uuid.New().String(),
+		mustGenerateSecretKey(64),
+		mustGenerateSecretKey(16),
+		mustGenerateSecretKey(64),
+		mustGenerateSecretKey(64),
 	})
 
 	return os.WriteFile(f, output.Bytes(), 0644)
 }
 
-// ErrorMessageFromConfigError tries building a more human-friendly error
-// from a configuration error. At the moment we can additionally extract
-// JSON syntax error line and column.
-// Related issue: https://github.com/golang/go/issues/43513.
-func ErrorMessageFromConfigError(err error, configPath string) string {
-	var configParseError viper.ConfigParseError
-	if ok := errors.As(err, &configParseError); ok {
-		var syntaxErr *json.SyntaxError
-		if ok := errors.As(configParseError.Err, &syntaxErr); ok {
-			if content, readFileErr := os.ReadFile(configPath); readFileErr == nil {
-				offset := int(syntaxErr.Offset)
-				line := 1 + bytes.Count(content[:offset], []byte("\n"))
-				column := offset - (bytes.LastIndex(content[:offset], []byte("\n")) + len("\n"))
-				return fmt.Sprintf(
-					"JSON syntax error around line %d, column %d: %s",
-					line, column, syntaxErr.Error(),
-				)
-			}
-		}
+func OptionalStringChoice(value string, choices []string) (string, error) {
+	if value == "" {
+		// Empty value is valid for optional configuration key.
+		return value, nil
 	}
-	// Fallback if we can't construct a better one.
-	return fmt.Sprintf("configuration error: %v", err)
+	if !slices.Contains(choices, value) {
+		return "", fmt.Errorf("invalid value: %s, possible choices are: %s", value, strings.Join(choices, ", "))
+	}
+	return value, nil
+}
+
+func mustGenerateSecretKey(byteLen int) string {
+	key := make([]byte, byteLen)
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(key)
 }

@@ -22,3 +22,11 @@ gomodifytags -file api.pb.go -field NumSubs -struct NodeResult -all -w -remove-o
 gomodifytags -file api.pb.go -field Channels -struct ChannelsResult -all -w -remove-options json=omitempty >/dev/null
 gomodifytags -file api.pb.go -field Connections -struct ConnectionsResult -all -w -remove-options json=omitempty >/dev/null
 gomodifytags -file api.pb.go -field Statuses -struct GetUserStatusResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field Items -struct DeviceListResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field Items -struct DeviceTopicListResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field Items -struct UserTopicListResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field Allowed -struct RateLimitResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field AllowedInMs -struct RateLimitResult -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field Allowed -struct RateLimitPolicyEvaluation -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field TokensLeft -struct RateLimitPolicyEvaluation -all -w -remove-options json=omitempty >/dev/null
+gomodifytags -file api.pb.go -field AllowedInMs -struct RateLimitPolicyEvaluation -all -w -remove-options json=omitempty >/dev/null

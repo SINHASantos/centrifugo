@@ -1,4 +1,4 @@
-Centrifugo is an open-source scalable real-time messaging server. Centrifugo can instantly deliver messages to application online users connected over supported transports (WebSocket, HTTP-streaming, SSE/EventSource, GRPC, SockJS, WebTransport). Centrifugo has the concept of a channel – so it's a user-facing PUB/SUB server.
+Centrifugo is an open-source scalable real-time messaging server. Centrifugo can instantly deliver messages to application online users connected over supported transports (WebSocket, HTTP-streaming, SSE/EventSource, GRPC, WebTransport). Centrifugo has the concept of a channel – so it's a user-facing PUB/SUB server.
 
 Centrifugo is language-agnostic and can be used to build chat apps, live comments, multiplayer games, real-time data visualizations, collaborative tools, etc. in combination with any backend. It is well suited for modern architectures and allows decoupling the business logic from the real-time transport layer.
 
@@ -6,9 +6,20 @@ Several official client SDKs for browser and mobile development wrap the bidirec
 
 For details, go to the [Centrifugo documentation site](https://centrifugal.dev).
 
-## Release notes
+## What's changed
 
 ### Improvements
 
-* Fully rewritten Redis engine using [rueian/rueidis](https://github.com/rueian/rueidis) library. Many thanks to [@j178](https://github.com/j178) and [@rueian](https://github.com/rueian) for the help. Check out details in our blog post [Improving Centrifugo Redis Engine throughput and allocation efficiency with Rueidis Go library](https://centrifugal.dev/blog/2022/12/20/improving-redis-engine-performance). We expect that new implementation is backwards compatible with the previous one except some timeout options which were not documented, please report issues if any.
-* Extended TLS configuration for Redis – it's now possible to set CA root cert, client TLS certs, set custom server name for TLS. See more details in the [updated Redis Engine option docs](https://centrifugal.dev/docs/server/engines#redis-engine-options). Also, it's now possible to provide certificates as strings.
+* Add development build warning in logs [#934](https://github.com/centrifugal/centrifugo/pull/934). On start, if Centrifugo is built from source without proper version attached (which is done in CI upon release workflow), the warning is now shown in logs.
+
+### Fixes
+
+* Fix not using redis prefix for Redis stream support check [centrifugal/centrifuge#456](https://github.com/centrifugal/centrifuge/pull/456). Addresses issue with Redis ACL, see [#935](https://github.com/centrifugal/centrifugo/issues/935).
+* Only non-empty tokens will be redacted in info logs now, which allows to distinguish the case when token was not sent at all, [centrifugal/centrifuge#455](https://github.com/centrifugal/centrifuge/pull/455)
+* Redact header values upon writing info logs with connect command since they can contain sensitive values, [centrifugal/centrifuge#458](https://github.com/centrifugal/centrifuge/pull/458)
+
+### Miscellaneous
+
+* Centrifugo v6 has been recently released 💻✨🔮✨💻. See the details in the [Centrifugo v6 release blog post](https://centrifugal.dev/blog/2025/01/16/centrifugo-v6-released).
+* This release is built with Go 1.23.5.
+* See also the corresponding [Centrifugo PRO release](https://github.com/centrifugal/centrifugo-pro/releases/tag/v6.0.2).

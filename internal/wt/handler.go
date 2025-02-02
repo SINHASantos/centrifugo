@@ -2,25 +2,28 @@ package wt
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/logging"
+
 	"github.com/centrifugal/centrifuge"
 	"github.com/centrifugal/protocol"
-	"github.com/marten-seemann/webtransport-go"
+	"github.com/quic-go/webtransport-go"
+	"github.com/rs/zerolog/log"
 )
 
 // Handler for WebTransport.
 type Handler struct {
-	config Config
-	server *webtransport.Server
-	node   *centrifuge.Node
+	config   Config
+	server   *webtransport.Server
+	node     *centrifuge.Node
+	pingPong centrifuge.PingPongConfig
 }
 
 // NewHandler creates new Handler.
-func NewHandler(node *centrifuge.Node, wtServer *webtransport.Server, config Config) *Handler {
-	return &Handler{config: config, server: wtServer, node: node}
+func NewHandler(node *centrifuge.Node, wtServer *webtransport.Server, config Config, pingPong centrifuge.PingPongConfig) *Handler {
+	return &Handler{config: config, server: wtServer, node: node, pingPong: pingPong}
 }
 
 const bidiStreamAcceptTimeout = 10 * time.Second
@@ -29,7 +32,7 @@ const bidiStreamAcceptTimeout = 10 * time.Second
 func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	conn, err := s.server.Upgrade(rw, r)
 	if err != nil {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "error upgrading to webtransport", map[string]interface{}{"error": err.Error()}))
+		log.Info().Str("transport", transportName).Err(err).Msg("error upgrading to webtransport")
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -39,7 +42,7 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	stream, err := conn.AcceptStream(acceptCtx)
 	if err != nil {
 		acceptCtxCancel()
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "stream accept error", map[string]interface{}{"error": err.Error()}))
+		log.Error().Err(err).Msg("stream accept error")
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -50,38 +53,37 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		protoType = centrifuge.ProtocolTypeProtobuf
 	}
 
-	transport := newWebtransportTransport(protoType, conn, stream, s.config.PingPongConfig)
+	transport := newWebtransportTransport(protoType, conn, stream, s.pingPong)
 	c, closeFn, err := centrifuge.NewClient(r.Context(), s.node, transport)
 	if err != nil {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "error creating client", map[string]interface{}{"transport": transportName}))
+		log.Error().Err(err).Msg("error creating client")
 		return
 	}
 	defer func() { _ = closeFn() }()
 
-	if s.node.LogEnabled(centrifuge.LogLevelDebug) {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]interface{}{"client": c.ID(), "transport": transportName}))
+	if logging.Enabled(logging.DebugLevel) {
+		log.Debug().Str("transport", transportName).Str("client", c.ID()).Msg("client connection established")
 		defer func(started time.Time) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]interface{}{"client": c.ID(), "transport": transportName, "duration": time.Since(started)}))
+			log.Debug().Str("transport", transportName).Str("client", c.ID()).Str("duration", time.Since(started).String()).Msg("client connection completed")
 		}(time.Now())
 	}
 
 	var decoder protocol.StreamCommandDecoder
 	if protoType == centrifuge.ProtocolTypeJSON {
-		decoder = protocol.NewJSONStreamCommandDecoder(stream)
+		decoder = protocol.GetStreamCommandDecoderLimited(protocol.TypeJSON, stream, int64(s.config.MessageSizeLimit))
+		defer protocol.PutStreamCommandDecoder(protocol.TypeJSON, decoder)
 	} else {
-		decoder = protocol.NewProtobufStreamCommandDecoder(stream)
+		decoder = protocol.NewProtobufStreamCommandDecoder(stream, int64(s.config.MessageSizeLimit))
+		defer protocol.PutStreamCommandDecoder(protocol.TypeProtobuf, decoder)
 	}
 
 	for {
-		cmd, data, err := decoder.Decode()
+		cmd, cmdSize, err := decoder.Decode()
 		if err != nil {
-			c.Disconnect(centrifuge.DisconnectBadRequest)
+			log.Error().Err(err).Str("transport", transportName).Str("client", c.ID()).Msg("error decoding command")
 			return
 		}
-		if s.node.LogEnabled(centrifuge.LogLevelTrace) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelTrace, "<--", map[string]interface{}{"client": c.ID(), "user": c.UserID(), "data": fmt.Sprintf("%#v", string(data))}))
-		}
-		ok := c.HandleCommand(cmd)
+		ok := c.HandleCommand(cmd, cmdSize)
 		if !ok {
 			return
 		}

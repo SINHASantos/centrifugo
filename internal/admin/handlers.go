@@ -5,53 +5,25 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/centrifugal/centrifugo/v4/internal/api"
-	"github.com/centrifugal/centrifugo/v4/internal/middleware"
-	"github.com/centrifugal/centrifugo/v4/internal/reverseproxy"
-	"github.com/centrifugal/centrifugo/v4/internal/tools"
+	"github.com/centrifugal/centrifugo/v6/internal/api"
+	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+	"github.com/centrifugal/centrifugo/v6/internal/middleware"
+	"github.com/centrifugal/centrifugo/v6/internal/reverseproxy"
+	"github.com/centrifugal/centrifugo/v6/internal/tools"
+	"github.com/centrifugal/centrifugo/v6/internal/webui"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/gorilla/securecookie"
 	"github.com/rs/zerolog/log"
 )
 
-// Config ...
-type Config struct {
-	// Prefix is a custom prefix to handle admin endpoints on.
-	Prefix string
+type Config = configtypes.Admin
 
-	// WebPath is path to admin web application to serve.
-	WebPath string
-
-	// WebProxyAddress is an address for proxying to the running admin web application app.
-	// So it's possible to run web app in dev mode and point Centrifugo to its address for
-	// development purposes.
-	WebProxyAddress string
-
-	// WebFS is custom filesystem to serve as admin web application.
-	// In our case we pass embedded web interface which implements
-	// FileSystem interface.
-	WebFS http.FileSystem
-
-	// Password is an admin password.
-	Password string
-
-	// Secret is a secret to generate auth token for admin requests.
-	Secret string
-
-	// Insecure turns on insecure mode for admin endpoints - no auth
-	// required to connect to web interface and for requests to admin API.
-	// Admin resources must be protected by firewall rules in production when
-	// this option enabled otherwise everyone from internet can make admin
-	// actions.
-	Insecure bool
-}
-
-// Handler handles admin web interface endpoints.
+// Handler handles admin web UI endpoints.
 type Handler struct {
 	mux    *http.ServeMux
 	node   *centrifuge.Node
-	config Config
+	config configtypes.Admin
 }
 
 // NewHandler creates new Handler.
@@ -61,9 +33,11 @@ func NewHandler(n *centrifuge.Node, apiExecutor *api.Executor, c Config) *Handle
 		config: c,
 	}
 	mux := http.NewServeMux()
-	prefix := strings.TrimRight(h.config.Prefix, "/")
+	prefix := strings.TrimRight(h.config.HandlerPrefix, "/")
+	mux.Handle(prefix+"/admin/settings", http.HandlerFunc(h.settingsHandler))
 	mux.Handle(prefix+"/admin/auth", middleware.Post(http.HandlerFunc(h.authHandler)))
-	mux.Handle(prefix+"/admin/api", middleware.Post(h.adminSecureTokenAuth(api.NewHandler(n, apiExecutor, api.Config{}))))
+	mux.Handle(prefix+"/admin/api", middleware.Post(h.adminSecureTokenAuth(api.NewHandler(n, apiExecutor, api.Config{}).OldRoute())))
+
 	webPrefix := prefix + "/"
 	if c.WebProxyAddress != "" {
 		log.Info().Str("address", c.WebProxyAddress).Msg("using admin web reverse proxy")
@@ -74,8 +48,8 @@ func NewHandler(n *centrifuge.Node, apiExecutor *api.Executor, c Config) *Handle
 		mux.HandleFunc(webPrefix, reverseproxy.ProxyRequestHandler(proxy))
 	} else if c.WebPath != "" {
 		mux.Handle(webPrefix, http.StripPrefix(webPrefix, http.FileServer(http.Dir(c.WebPath))))
-	} else if c.WebFS != nil {
-		mux.Handle(webPrefix, http.StripPrefix(webPrefix, http.FileServer(c.WebFS)))
+	} else {
+		mux.Handle(webPrefix, http.StripPrefix(webPrefix, http.FileServer(webui.FS)))
 	}
 	h.mux = mux
 	return h
@@ -86,7 +60,6 @@ func (s *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Handler) adminSecureTokenAuth(h http.Handler) http.Handler {
-
 	secret := s.config.Secret
 	insecure := s.config.Insecure
 
@@ -129,22 +102,22 @@ func (s *Handler) adminSecureTokenAuth(h http.Handler) http.Handler {
 	})
 }
 
+// settingsHandler allows to get admin web interface settings.
+func (s *Handler) settingsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{
+		"insecure": s.config.Insecure,
+		"edition":  "oss",
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // authHandler allows to get admin web interface token.
 func (s *Handler) authHandler(w http.ResponseWriter, r *http.Request) {
 	formPassword := r.FormValue("password")
 
-	insecure := s.config.Insecure
 	password := s.config.Password
 	secret := s.config.Secret
-
-	if insecure {
-		w.Header().Set("Content-Type", "application/json")
-		resp := map[string]string{
-			"token": "insecure",
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-		return
-	}
 
 	if password == "" || secret == "" {
 		log.Error().Msg("admin_password and admin_secret must be set in configuration")

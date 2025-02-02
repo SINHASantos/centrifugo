@@ -3,31 +3,8 @@ package proxy
 import (
 	"context"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
-
-	"github.com/centrifugal/centrifuge"
+	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
 )
-
-// SubscribeRequest ...
-type SubscribeRequest struct {
-	ClientID  string
-	UserID    string
-	Channel   string
-	Transport centrifuge.TransportInfo
-	Token     string
-}
-
-// SubscribeResult ...
-type SubscribeResult struct {
-	SubscribeOptions
-}
-
-// SubscribeReply ...
-type SubscribeReply struct {
-	Result     *SubscribeResult       `json:"result"`
-	Error      *centrifuge.Error      `json:"error"`
-	Disconnect *centrifuge.Disconnect `json:"disconnect"`
-}
 
 // SubscribeProxy allows to send Subscribe requests.
 type SubscribeProxy interface {

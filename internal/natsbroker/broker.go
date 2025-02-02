@@ -8,9 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+
 	"github.com/centrifugal/centrifuge"
 	"github.com/centrifugal/protocol"
 	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog/log"
 )
 
 type (
@@ -18,12 +21,11 @@ type (
 	channelID string
 )
 
-// Config of NatsBroker.
-type Config struct {
-	URL          string
-	Prefix       string
-	DialTimeout  time.Duration
-	WriteTimeout time.Duration
+type Config = configtypes.NatsBroker
+
+type subWrapper struct {
+	sub         *nats.Subscription
+	origChannel string
 }
 
 // NatsBroker is a broker on top of Nats messaging system.
@@ -31,10 +33,12 @@ type NatsBroker struct {
 	node   *centrifuge.Node
 	config Config
 
-	nc           *nats.Conn
-	subsMu       sync.Mutex
-	subs         map[channelID]*nats.Subscription
-	eventHandler centrifuge.BrokerEventHandler
+	nc                  *nats.Conn
+	subsMu              sync.RWMutex
+	subs                map[channelID]subWrapper
+	eventHandler        centrifuge.BrokerEventHandler
+	clientChannelPrefix string
+	rawModeReplacer     *strings.Replacer
 }
 
 var _ centrifuge.Broker = (*NatsBroker)(nil)
@@ -42,9 +46,20 @@ var _ centrifuge.Broker = (*NatsBroker)(nil)
 // New creates NatsBroker.
 func New(n *centrifuge.Node, conf Config) (*NatsBroker, error) {
 	b := &NatsBroker{
-		node:   n,
-		config: conf,
-		subs:   make(map[channelID]*nats.Subscription),
+		node:                n,
+		config:              conf,
+		subs:                make(map[channelID]subWrapper),
+		clientChannelPrefix: conf.Prefix + ".client.",
+	}
+	if conf.RawMode.Enabled {
+		log.Info().Str("raw_mode_prefix", conf.RawMode.Prefix).Msg("raw mode of Nats enabled")
+		if len(conf.RawMode.ChannelReplacements) > 0 {
+			var replacerArgs []string
+			for k, v := range conf.RawMode.ChannelReplacements {
+				replacerArgs = append(replacerArgs, k, v)
+			}
+			b.rawModeReplacer = strings.NewReplacer(replacerArgs...)
+		}
 	}
 	return b, nil
 }
@@ -58,7 +73,13 @@ func (b *NatsBroker) nodeChannel(nodeID string) channelID {
 }
 
 func (b *NatsBroker) clientChannel(ch string) channelID {
-	return channelID(b.config.Prefix + ".client." + ch)
+	if b.config.RawMode.Enabled {
+		if b.rawModeReplacer != nil {
+			ch = b.rawModeReplacer.Replace(ch)
+		}
+		return channelID(b.config.RawMode.Prefix + ch)
+	}
+	return channelID(b.clientChannelPrefix + ch)
 }
 
 // Run runs engine after node initialized.
@@ -68,13 +89,20 @@ func (b *NatsBroker) Run(h centrifuge.BrokerEventHandler) error {
 	if url == "" {
 		url = nats.DefaultURL
 	}
-	nc, err := nats.Connect(
-		url,
+	options := []nats.Option{
 		nats.ReconnectBufSize(-1),
 		nats.MaxReconnects(-1),
-		nats.Timeout(b.config.DialTimeout),
-		nats.FlusherTimeout(b.config.WriteTimeout),
-	)
+		nats.Timeout(b.config.DialTimeout.ToDuration()),
+		nats.FlusherTimeout(b.config.WriteTimeout.ToDuration()),
+	}
+	if b.config.TLS.Enabled {
+		tlsConfig, err := b.config.TLS.ToGoTLSConfig("nats")
+		if err != nil {
+			return fmt.Errorf("error creating TLS config: %w", err)
+		}
+		options = append(options, nats.Secure(tlsConfig))
+	}
+	nc, err := nats.Connect(url, options...)
 	if err != nil {
 		return fmt.Errorf("error connecting to %s: %w", url, err)
 	}
@@ -87,42 +115,98 @@ func (b *NatsBroker) Run(h centrifuge.BrokerEventHandler) error {
 		return err
 	}
 	b.nc = nc
-	b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, fmt.Sprintf("Nats Broker connected to: %s", url)))
+	log.Info().Str("broker", "nats").Str("url", url).Msg("broker running")
 	return nil
 }
 
-// Close is not implemented.
+// Close ...
 func (b *NatsBroker) Close(_ context.Context) error {
+	b.nc.Close()
 	return nil
 }
 
-func isUnsupportedChannel(ch string) bool {
-	return strings.Contains(ch, "*") || strings.Contains(ch, ">")
+func (b *NatsBroker) IsSupportedSubscribeChannel(ch string) bool {
+	if b.config.AllowWildcards {
+		return true
+	}
+	if strings.Contains(ch, "*") || strings.Contains(ch, ">") {
+		return false
+	}
+	return true
+}
+
+func (b *NatsBroker) IsSupportedPublishChannel(ch string) bool {
+	if strings.Contains(ch, "*") || strings.Contains(ch, ">") {
+		return false
+	}
+	return true
 }
 
 // Publish - see Broker interface description.
-func (b *NatsBroker) Publish(ch string, data []byte, opts centrifuge.PublishOptions) (centrifuge.StreamPosition, error) {
-	if isUnsupportedChannel(ch) {
+func (b *NatsBroker) Publish(ch string, data []byte, opts centrifuge.PublishOptions) (centrifuge.StreamPosition, bool, error) {
+	if !b.IsSupportedPublishChannel(ch) {
 		// Do not support wildcard subscriptions.
-		return centrifuge.StreamPosition{}, centrifuge.ErrorBadRequest
+		return centrifuge.StreamPosition{}, false, centrifuge.ErrorBadRequest
+	}
+	if b.config.RawMode.Enabled {
+		return centrifuge.StreamPosition{}, false, b.nc.Publish(b.config.RawMode.Prefix+ch, data)
 	}
 	push := &protocol.Push{
 		Channel: ch,
 		Pub: &protocol.Publication{
-			Data: data,
-			Info: infoToProto(opts.ClientInfo),
-			Tags: opts.Tags,
+			Data:  data,
+			Info:  infoToProto(opts.ClientInfo),
+			Tags:  opts.Tags,
+			Delta: opts.UseDelta, // Will be cleaned up before passing to Node.
+			Time:  time.Now().UnixMilli(),
 		},
 	}
 	byteMessage, err := push.MarshalVT()
 	if err != nil {
-		return centrifuge.StreamPosition{}, err
+		return centrifuge.StreamPosition{}, false, err
 	}
-	return centrifuge.StreamPosition{}, b.nc.Publish(string(b.clientChannel(ch)), byteMessage)
+	return centrifuge.StreamPosition{}, false, b.nc.Publish(string(b.clientChannel(ch)), byteMessage)
+}
+
+// We experimentally support attaching epoch to publication.
+const epochTagsKey = "__centrifugo_epoch"
+
+func (b *NatsBroker) PublishWithStreamPosition(ch string, data []byte, opts centrifuge.PublishOptions, sp centrifuge.StreamPosition) error {
+	if !b.IsSupportedPublishChannel(ch) {
+		// Do not support wildcard subscriptions.
+		return centrifuge.ErrorBadRequest
+	}
+	if b.config.RawMode.Enabled {
+		// Do not support stream positions in raw mode.
+		return centrifuge.ErrorBadRequest
+	}
+	tags := opts.Tags
+	if tags == nil {
+		tags = map[string]string{}
+	}
+	tags[epochTagsKey] = sp.Epoch
+	push := &protocol.Push{
+		Channel: ch,
+		Pub: &protocol.Publication{
+			Offset: sp.Offset,
+			Data:   data,
+			Info:   infoToProto(opts.ClientInfo),
+			Tags:   tags,
+			Delta:  opts.UseDelta, // Will be cleaned up before passing to Node.
+		},
+	}
+	byteMessage, err := push.MarshalVT()
+	if err != nil {
+		return err
+	}
+	return b.nc.Publish(string(b.clientChannel(ch)), byteMessage)
 }
 
 // PublishJoin - see Broker interface description.
 func (b *NatsBroker) PublishJoin(ch string, info *centrifuge.ClientInfo) error {
+	if b.config.RawMode.Enabled {
+		return nil
+	}
 	push := &protocol.Push{
 		Channel: ch,
 		Join: &protocol.Join{
@@ -138,6 +222,9 @@ func (b *NatsBroker) PublishJoin(ch string, info *centrifuge.ClientInfo) error {
 
 // PublishLeave - see Broker interface description.
 func (b *NatsBroker) PublishLeave(ch string, info *centrifuge.ClientInfo) error {
+	if b.config.RawMode.Enabled {
+		return nil
+	}
 	push := &protocol.Push{
 		Channel: ch,
 		Leave: &protocol.Leave{
@@ -163,7 +250,7 @@ func (b *NatsBroker) PublishControl(data []byte, nodeID, _ string) error {
 }
 
 // History ...
-func (b *NatsBroker) History(_ string, _ centrifuge.HistoryFilter) ([]*centrifuge.Publication, centrifuge.StreamPosition, error) {
+func (b *NatsBroker) History(_ string, _ centrifuge.HistoryOptions) ([]*centrifuge.Publication, centrifuge.StreamPosition, error) {
 	return nil, centrifuge.StreamPosition{}, centrifuge.ErrorNotAvailable
 }
 
@@ -172,26 +259,55 @@ func (b *NatsBroker) RemoveHistory(_ string) error {
 	return centrifuge.ErrorNotAvailable
 }
 
-func (b *NatsBroker) handleClientMessage(data []byte) {
+func (b *NatsBroker) handleClientMessage(subject string, data []byte, sub *nats.Subscription) {
+	if b.config.RawMode.Enabled {
+		b.subsMu.RLock()
+		subWrap, ok := b.subs[channelID(sub.Subject)]
+		b.subsMu.RUnlock()
+		if !ok {
+			return
+		}
+		channel := subWrap.origChannel
+		_ = b.eventHandler.HandlePublication(
+			channel,
+			&centrifuge.Publication{Data: data, Channel: strings.TrimPrefix(subject, b.config.RawMode.Prefix)},
+			centrifuge.StreamPosition{}, false, nil)
+		return
+	}
+
 	var push protocol.Push
 	err := push.UnmarshalVT(data)
 	if err != nil {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "can't unmarshal push from Nats", map[string]interface{}{"error": err.Error()}))
+		log.Error().Err(err).Msg("error unmarshal push from Nats")
 		return
 	}
+
 	if push.Pub != nil {
-		_ = b.eventHandler.HandlePublication(push.Channel, pubFromProto(push.Pub), centrifuge.StreamPosition{})
+		var subChannel = push.Channel
+		var specificChannel string
+		if b.config.AllowWildcards {
+			subChannel = strings.TrimPrefix(sub.Subject, b.clientChannelPrefix)
+			specificChannel = push.Channel
+		}
+		sp := centrifuge.StreamPosition{}
+		if push.Pub.Offset > 0 && push.Pub.Tags != nil {
+			sp.Offset = push.Pub.Offset
+			sp.Epoch = push.Pub.Tags[epochTagsKey]
+		}
+		delta := push.Pub.Delta
+		push.Pub.Delta = false
+		_ = b.eventHandler.HandlePublication(subChannel, pubFromProto(push.Pub, specificChannel), sp, delta, nil)
 	} else if push.Join != nil {
 		_ = b.eventHandler.HandleJoin(push.Channel, infoFromProto(push.Join.Info))
 	} else if push.Leave != nil {
 		_ = b.eventHandler.HandleLeave(push.Channel, infoFromProto(push.Leave.Info))
 	} else {
-		b.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "unknown push from Nats", map[string]interface{}{"push": fmt.Sprintf("%v", &push)}))
+		log.Warn().Str("push", fmt.Sprintf("%v", &push)).Msg("unknown push from Nats")
 	}
 }
 
 func (b *NatsBroker) handleClient(m *nats.Msg) {
-	b.handleClientMessage(m.Data)
+	b.handleClientMessage(m.Subject, m.Data, m.Sub)
 }
 
 func (b *NatsBroker) handleControl(m *nats.Msg) {
@@ -200,38 +316,46 @@ func (b *NatsBroker) handleControl(m *nats.Msg) {
 
 // Subscribe - see Broker interface description.
 func (b *NatsBroker) Subscribe(ch string) error {
-	if isUnsupportedChannel(ch) {
+	if !b.IsSupportedSubscribeChannel(ch) {
 		// Do not support wildcard subscriptions.
 		return centrifuge.ErrorBadRequest
 	}
-	b.subsMu.Lock()
-	defer b.subsMu.Unlock()
 	clientChannel := b.clientChannel(ch)
-	if _, ok := b.subs[clientChannel]; ok {
+	b.subsMu.RLock()
+	_, ok := b.subs[clientChannel]
+	b.subsMu.RUnlock()
+	if ok {
 		return nil
 	}
-	subClient, err := b.nc.Subscribe(string(b.clientChannel(ch)), b.handleClient)
+	subscription, err := b.nc.Subscribe(string(clientChannel), b.handleClient)
 	if err != nil {
 		return err
 	}
-	b.subs[clientChannel] = subClient
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
+	b.subs[clientChannel] = subWrapper{
+		sub:         subscription,
+		origChannel: ch,
+	}
 	return nil
 }
 
 // Unsubscribe - see Broker interface description.
 func (b *NatsBroker) Unsubscribe(ch string) error {
-	b.subsMu.Lock()
-	defer b.subsMu.Unlock()
-	if sub, ok := b.subs[b.clientChannel(ch)]; ok {
-		_ = sub.Unsubscribe()
-		delete(b.subs, b.clientChannel(ch))
+	clientChannel := b.clientChannel(ch)
+	b.subsMu.RLock()
+	subWrap, ok := b.subs[clientChannel]
+	b.subsMu.RUnlock()
+	if ok {
+		err := subWrap.sub.Unsubscribe()
+		if err != nil {
+			return err
+		}
+		b.subsMu.Lock()
+		defer b.subsMu.Unlock()
+		delete(b.subs, clientChannel)
 	}
 	return nil
-}
-
-// Channels - see Broker interface description.
-func (b *NatsBroker) Channels() ([]string, error) {
-	return nil, nil
 }
 
 func infoFromProto(v *protocol.ClientInfo) *centrifuge.ClientInfo {
@@ -268,13 +392,14 @@ func infoToProto(v *centrifuge.ClientInfo) *protocol.ClientInfo {
 	return info
 }
 
-func pubFromProto(pub *protocol.Publication) *centrifuge.Publication {
+func pubFromProto(pub *protocol.Publication, specificChannel string) *centrifuge.Publication {
 	if pub == nil {
 		return nil
 	}
 	return &centrifuge.Publication{
-		Offset: pub.GetOffset(),
-		Data:   pub.Data,
-		Info:   infoFromProto(pub.GetInfo()),
+		Offset:  pub.GetOffset(),
+		Data:    pub.Data,
+		Info:    infoFromProto(pub.GetInfo()),
+		Channel: specificChannel,
 	}
 }

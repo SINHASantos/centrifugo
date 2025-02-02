@@ -2,13 +2,14 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
 
 	"github.com/centrifugal/centrifuge"
 	"google.golang.org/grpc"
@@ -67,7 +68,7 @@ func (t *TestTransport) Protocol() centrifuge.ProtocolType {
 
 // ProtocolVersion returns transport protocol version.
 func (t *TestTransport) ProtocolVersion() centrifuge.ProtocolVersion {
-	return centrifuge.ProtocolVersion1
+	return centrifuge.ProtocolVersion2
 }
 
 // Unidirectional - ...
@@ -80,11 +81,9 @@ func (t *TestTransport) DisabledPushFlags() uint64 {
 	return centrifuge.PushFlagDisconnect
 }
 
-// AppLevelPing ...
-func (t *TestTransport) AppLevelPing() centrifuge.AppLevelPing {
-	return centrifuge.AppLevelPing{
-		PingInterval: 0,
-	}
+// PingPongConfig ...
+func (t *TestTransport) PingPongConfig() centrifuge.PingPongConfig {
+	return centrifuge.PingPongConfig{}
 }
 
 // Emulation ...
@@ -187,7 +186,7 @@ func NewCommonGRPCProxyTestCase(ctx context.Context, srv proxyproto.CentrifugoPr
 	proxyproto.RegisterCentrifugoProxyServer(server, srv)
 
 	go func() {
-		if err := server.Serve(listener); err != nil {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			log.Fatalf("GRPC server exited with error: %v", err)
 		}
 	}()
@@ -213,39 +212,72 @@ type TestClientMock struct {
 	IsSubscribedFunc func(string) bool
 	ContextFunc      func() context.Context
 	TransportFunc    func() centrifuge.TransportInfo
+	storageMu        sync.Mutex
+	storage          map[string]any
 }
 
-func (m TestClientMock) ID() string {
+func (m *TestClientMock) Send(bytes []byte) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *TestClientMock) Disconnect(disconnect ...centrifuge.Disconnect) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *TestClientMock) WritePublication(channel string, publication *centrifuge.Publication, sp centrifuge.StreamPosition) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *TestClientMock) ID() string {
 	if m.IDFunc != nil {
 		return m.IDFunc()
 	}
 	panic("not implemented")
 }
 
-func (m TestClientMock) UserID() string {
+func (m *TestClientMock) UserID() string {
 	if m.UserIDFunc != nil {
 		return m.UserIDFunc()
 	}
 	panic("not implemented")
 }
 
-func (m TestClientMock) IsSubscribed(s string) bool {
+func (m *TestClientMock) IsSubscribed(s string) bool {
 	if m.IsSubscribedFunc != nil {
 		return m.IsSubscribedFunc(s)
 	}
 	panic("not implemented")
 }
 
-func (m TestClientMock) Context() context.Context {
+func (m *TestClientMock) Context() context.Context {
 	if m.ContextFunc != nil {
 		return m.ContextFunc()
 	}
 	panic("not implemented")
 }
 
-func (m TestClientMock) Transport() centrifuge.TransportInfo {
+func (m *TestClientMock) Transport() centrifuge.TransportInfo {
 	if m.TransportFunc != nil {
 		return m.TransportFunc()
 	}
 	panic("not implemented")
+}
+
+func (m *TestClientMock) AcquireStorage() (map[string]any, func(map[string]any)) {
+	m.storageMu.Lock()
+	if m.storage == nil {
+		m.storage = map[string]any{}
+	}
+	return m.storage, func(updatedStorage map[string]any) {
+		m.storage = updatedStorage
+		m.storageMu.Unlock()
+	}
+}
+
+func (m *TestClientMock) Unsubscribe(ch string, unsubscribe ...centrifuge.Unsubscribe) {
+	//TODO implement me
+	panic("implement me")
 }

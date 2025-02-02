@@ -5,10 +5,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
+	"github.com/centrifugal/centrifugo/v6/internal/config"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -28,15 +30,30 @@ func init() {
 	_ = prometheus.DefaultRegisterer.Register(connLimitReached)
 }
 
-func ConnLimit(node *centrifuge.Node, ruleContainer *rule.Container, h http.Handler) http.Handler {
+type ConnLimit struct {
+	node         *centrifuge.Node
+	cfgContainer *config.Container
+	rl           *rate.Limiter
+}
+
+func NewConnLimit(node *centrifuge.Node, cfgContainer *config.Container) *ConnLimit {
+	rl := connectionRateLimiter(cfgContainer.Config().Client.ConnectionRateLimit)
+	return &ConnLimit{node: node, cfgContainer: cfgContainer, rl: rl}
+}
+
+func (l *ConnLimit) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connLimit := ruleContainer.Config().ClientConnectionLimit
-		if connLimit > 0 && node.Hub().NumClients() >= connLimit {
+		if l.rl != nil && !l.rl.Allow() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		connLimit := l.cfgContainer.Config().Client.ConnectionLimit
+		if connLimit > 0 && l.node.Hub().NumClients() >= connLimit {
 			connLimitReached.Inc()
 			now := time.Now().UnixNano()
 			prevLoggedAt := atomic.LoadInt64(&connLimitReachedLoggedAt)
 			if prevLoggedAt == 0 || now-prevLoggedAt > connLimitReachedLogThrottle {
-				node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "node connection limit reached", map[string]interface{}{"limit": connLimit}))
+				log.Warn().Int("limit", connLimit).Msg("node connection limit reached")
 				atomic.StoreInt64(&connLimitReachedLoggedAt, now)
 			}
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -44,4 +61,11 @@ func ConnLimit(node *centrifuge.Node, ruleContainer *rule.Container, h http.Hand
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+func connectionRateLimiter(connRateLimit int) *rate.Limiter {
+	if connRateLimit > 0 {
+		return rate.NewLimiter(rate.Every(time.Second), connRateLimit)
+	}
+	return nil
 }

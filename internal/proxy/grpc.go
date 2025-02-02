@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
-	"github.com/centrifugal/centrifugo/v4/internal/middleware"
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v6/internal/clientcontext"
+	"github.com/centrifugal/centrifugo/v6/internal/middleware"
+	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -47,46 +50,54 @@ func getGrpcHost(endpoint string) (string, error) {
 	return host, nil
 }
 
-func getDialOpts(p Proxy) ([]grpc.DialOption, error) {
+func getDialOpts(name string, p Config) ([]grpc.DialOption, error) {
 	var dialOpts []grpc.DialOption
-	if p.GrpcCredentialsKey != "" {
+	if p.GRPC.CredentialsKey != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&rpcCredentials{
-			key:   p.GrpcCredentialsKey,
-			value: p.GrpcCredentialsValue,
+			key:   p.GRPC.CredentialsKey,
+			value: p.GRPC.CredentialsValue,
 		}))
 	}
-	if p.GrpcCertFile != "" {
-		cred, err := credentials.NewClientTLSFromFile(p.GrpcCertFile, "")
+	if p.GRPC.TLS.Enabled {
+		tlsConfig, err := p.GRPC.TLS.ToGoTLSConfig("proxy_grpc:" + name)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create TLS credentials %v", err)
+			return nil, fmt.Errorf("failed to create TLS config %v", err)
 		}
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(cred))
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	} else {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
-
-	if p.testGrpcDialer != nil {
-		dialOpts = append(dialOpts, grpc.WithContextDialer(p.testGrpcDialer))
+	if p.GRPC.Compression {
+		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
 	}
 
-	dialOpts = append(dialOpts, grpc.WithBlock())
+	if p.TestGrpcDialer != nil {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(p.TestGrpcDialer))
+	}
+
 	return dialOpts, nil
 }
 
-func grpcRequestContext(ctx context.Context, proxy Proxy) context.Context {
+func grpcRequestContext(ctx context.Context, proxy Config) context.Context {
 	md := requestMetadata(ctx, proxy.HttpHeaders, proxy.GrpcMetadata)
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
-func httpRequestHeaders(ctx context.Context, proxy Proxy) http.Header {
-	return requestHeaders(ctx, proxy.HttpHeaders, proxy.GrpcMetadata)
+func httpRequestHeaders(ctx context.Context, proxy Config) http.Header {
+	return requestHeaders(ctx, proxy.HttpHeaders, proxy.GrpcMetadata, proxy.HTTP.StaticHeaders)
 }
 
 func requestMetadata(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string) metadata.MD {
 	requestMD := metadata.MD{}
+	emulatedHeaders, _ := clientcontext.GetEmulatedHeadersFromContext(ctx)
+	for k, v := range emulatedHeaders {
+		if slices.Contains(allowedHeaders, strings.ToLower(k)) {
+			requestMD.Set(k, v)
+		}
+	}
 	if headers, ok := middleware.GetHeadersFromContext(ctx); ok {
 		for k, vv := range headers {
-			if stringInSlice(strings.ToLower(k), allowedHeaders) {
+			if slices.Contains(allowedHeaders, strings.ToLower(k)) {
 				requestMD.Set(k, vv...)
 			}
 		}
@@ -94,22 +105,31 @@ func requestMetadata(ctx context.Context, allowedHeaders []string, allowedMetaKe
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
 	for k, vv := range md {
-		if stringInSlice(k, allowedMetaKeys) {
+		if slices.Contains(allowedMetaKeys, k) {
 			requestMD[k] = vv
 		}
 	}
 	return requestMD
 }
 
-func requestHeaders(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string) http.Header {
-	headers := http.Header{}
+func requestHeaders(ctx context.Context, allowedHeaders []string, allowedMetaKeys []string, staticHeaders map[string]string) http.Header {
+	emulatedHeaders, _ := clientcontext.GetEmulatedHeadersFromContext(ctx)
 	if headers, ok := middleware.GetHeadersFromContext(ctx); ok {
-		return getProxyHeader(headers, allowedHeaders)
+		return getProxyHeader(headers, allowedHeaders, staticHeaders, emulatedHeaders)
+	}
+	headers := http.Header{}
+	for k, v := range staticHeaders {
+		headers.Set(k, v)
+	}
+	for k, v := range emulatedHeaders {
+		if slices.Contains(allowedHeaders, strings.ToLower(k)) {
+			headers.Set(k, v)
+		}
 	}
 	headers.Set("Content-Type", "application/json")
 	md, _ := metadata.FromIncomingContext(ctx)
 	for k, vv := range md {
-		if stringInSlice(k, allowedMetaKeys) {
+		if slices.Contains(allowedMetaKeys, k) {
 			headers[k] = vv
 		}
 	}

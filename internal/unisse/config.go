@@ -1,12 +1,7 @@
 package unisse
 
-import "github.com/centrifugal/centrifuge"
+import (
+	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+)
 
-type Config struct {
-	// ProtocolVersion used by default. If not set then we use centrifuge.ProtocolVersion1.
-	ProtocolVersion centrifuge.ProtocolVersion
-	// MaxRequestBodySize for POST requests when used.
-	MaxRequestBodySize int
-
-	centrifuge.PingPongConfig
-}
+type Config = configtypes.UniSSE
