@@ -7,19 +7,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/build"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
+	"github.com/centrifugal/centrifugo/v6/internal/build"
+	"github.com/centrifugal/centrifugo/v6/internal/config"
+	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+	"github.com/centrifugal/centrifugo/v6/internal/consuming"
 
 	"github.com/centrifugal/centrifuge"
+	"github.com/rs/zerolog/log"
 )
 
 var statsRand *rand.Rand
@@ -51,7 +54,7 @@ func init() {
 type Sender struct {
 	mu             sync.RWMutex
 	node           *centrifuge.Node
-	rules          *rule.Container
+	rules          *config.Container
 	features       Features
 	maxNumNodes    int
 	maxNumClients  int
@@ -65,28 +68,36 @@ type Features struct {
 	Version string
 	Edition string
 
-	// Engine or broker usage.
-	Engine     string
-	EngineMode string
-	Broker     string
-	BrokerMode string
+	// Engine or broker/presence manager usage.
+	EngineEnabled          bool
+	EngineType             string
+	EngineMode             string
+	BrokerEnabled          bool
+	BrokerType             string
+	BrokerMode             string
+	PresenceManagerEnabled bool
+	PresenceManagerType    string
+	PresenceManagerMode    string
 
 	// Transports.
 	Websocket     bool
 	HTTPStream    bool
 	SSE           bool
-	SockJS        bool
 	UniWebsocket  bool
 	UniGRPC       bool
 	UniSSE        bool
 	UniHTTPStream bool
 
 	// Proxies.
-	ConnectProxy   bool
-	RefreshProxy   bool
-	SubscribeProxy bool
-	PublishProxy   bool
-	RPCProxy       bool
+	ConnectProxy         bool
+	RefreshProxy         bool
+	SubscribeProxy       bool
+	PublishProxy         bool
+	RPCProxy             bool
+	SubRefreshProxy      bool
+	SubscribeStreamProxy bool
+
+	EnabledConsumers []string
 
 	// Uses GRPC server API.
 	GrpcAPI bool
@@ -103,7 +114,7 @@ type Features struct {
 }
 
 // NewSender creates usage stats sender.
-func NewSender(node *centrifuge.Node, rules *rule.Container, features Features) *Sender {
+func NewSender(node *centrifuge.Node, rules *config.Container, features Features) *Sender {
 	return &Sender{
 		node:     node,
 		rules:    rules,
@@ -121,48 +132,48 @@ func (s *Sender) isDev() bool {
 	return s.features.Version == "0.0.0"
 }
 
-// Start sending usage stats. How it works:
+// Run usage stats sender. How it works:
 // First send in between 24-48h from node start.
 // After the initial delay has passed: every hour check last time stats were sent by all
 // the nodes in a Centrifugo cluster. If no points were sent in last 24h, then push metrics
 // and update push time on all nodes (broadcast current time). There is still a chance of
 // duplicate data sending – but should be rare and tolerable for the purpose.
-func (s *Sender) Start(ctx context.Context) {
+func (s *Sender) Run(ctx context.Context) error {
 	firstTimeSend := time.Now().Add(initialDelay)
 	if s.isDev() {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: schedule next send", map[string]interface{}{"delay": initialDelay.String()}))
+		log.Debug().Str("delay", initialDelay.String()).Msg("usage stats: schedule next send")
 	}
 
 	// Wait 1/4 of a delay to randomize hourly ticks on different nodes.
 	select {
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	case <-time.After(initialDelay / 4):
 	}
 
 	if s.isDev() {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: start periodic ticks", map[string]interface{}{}))
+		log.Debug().Msg("usage stats: start periodic ticks")
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-time.After(tickInterval):
 			if s.isDev() {
-				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: updating max values", map[string]interface{}{}))
+				log.Debug().Msg("usage stats: tick")
 			}
 			err := s.updateMaxValues()
 			if err != nil {
 				if s.isDev() {
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "usage stats: error updating max values", map[string]interface{}{"error": err.Error()}))
+					log.Error().Err(err).Msg("usage stats: error updating max values")
 				}
 				continue
 			}
 
 			if time.Now().Before(firstTimeSend) {
 				if s.isDev() {
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: too early to send first time", map[string]interface{}{}))
+					log.Debug().Msg("usage stats: too early to send first time")
 				}
 				continue
 			}
@@ -176,18 +187,25 @@ func (s *Sender) Start(ctx context.Context) {
 
 			if lastSentAt > 0 && time.Now().Unix() <= lastSentAt+int64(sendInterval.Seconds()) {
 				if s.isDev() {
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: too early to send", map[string]interface{}{}))
+					log.Debug().Msg("usage stats: too early to send")
 				}
 				continue
 			}
 
 			if s.isDev() {
-				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: sending usage stats", map[string]interface{}{}))
+				log.Debug().Msg("usage stats: sending usage stats")
 			}
-			err = s.sendUsageStats(s.prepareMetrics(), build.UsageStatsEndpoint, build.UsageStatsToken)
+			metrics, err := s.prepareMetrics()
 			if err != nil {
 				if s.isDev() {
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "usage stats: error sending", map[string]interface{}{"error": err.Error()}))
+					log.Error().Err(err).Msg("usage stats: error preparing metrics")
+				}
+				continue
+			}
+			err = s.sendUsageStats(metrics, build.UsageStatsEndpoint, build.UsageStatsToken)
+			if err != nil {
+				if s.isDev() {
+					log.Error().Err(err).Msg("usage stats: error sending")
 				}
 				continue
 			}
@@ -214,7 +232,7 @@ func (s *Sender) broadcastLastSentAt() {
 	if err := s.node.Notify(LastSentUpdateNotificationOp, data, ""); err != nil {
 		// Issue a single retry.
 		if err = s.node.Notify(LastSentUpdateNotificationOp, data, ""); err != nil {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "usage stats: error broadcasting stats lastSentAt", map[string]interface{}{"error": err.Error()}))
+			log.Error().Err(err).Msg("usage stats: error broadcasting stats last sent at value")
 		}
 	}
 }
@@ -226,14 +244,14 @@ func (s *Sender) UpdateLastSentAt(data []byte) {
 	var envelope lastSentAtEnvelope
 	err := json.Unmarshal(data, &envelope)
 	if err != nil {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelError, "usage stats: error decoding lastSentAtEnvelope", map[string]interface{}{"error": err.Error()}))
+		log.Error().Err(err).Msg("usage stats: error decoding lastSentAtEnvelope")
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if envelope.LastSentAt > s.lastSentAt {
 		if s.isDev() {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: updating last sent to value from another node", map[string]interface{}{}))
+			log.Debug().Msg("usage stats: updating last sent to value from another node")
 		}
 		s.lastSentAt = envelope.LastSentAt
 		s.resetMaxValues()
@@ -300,7 +318,7 @@ func (s *Sender) resetMaxValues() {
 	s.maxNumChannels = 0
 }
 
-func (s *Sender) prepareMetrics() []*metric {
+func (s *Sender) prepareMetrics() ([]*metric, error) {
 	now := time.Now().Unix()
 
 	createPoint := func(name string) *metric {
@@ -319,6 +337,7 @@ func (s *Sender) prepareMetrics() []*metric {
 
 	version := strings.Replace(s.features.Version, ".", "_", -1)
 	edition := strings.ToLower(s.features.Edition)
+
 	engineMode := s.features.EngineMode
 	if engineMode == "" {
 		engineMode = "default"
@@ -327,6 +346,10 @@ func (s *Sender) prepareMetrics() []*metric {
 	if brokerMode == "" {
 		brokerMode = "default"
 	}
+	presenceManagerMode := s.features.PresenceManagerMode
+	if presenceManagerMode == "" {
+		presenceManagerMode = "default"
+	}
 
 	var metrics []*metric
 
@@ -334,10 +357,14 @@ func (s *Sender) prepareMetrics() []*metric {
 	metrics = append(metrics, createPoint("version."+version+".edition."+edition))
 	metrics = append(metrics, createPoint("arch."+runtime.GOARCH+".os."+runtime.GOOS))
 
-	if s.features.Broker == "" {
-		metrics = append(metrics, createPoint("engine."+s.features.Engine+".mode."+engineMode))
-	} else {
-		metrics = append(metrics, createPoint("broker."+s.features.Broker+".mode."+brokerMode))
+	if s.features.EngineEnabled {
+		metrics = append(metrics, createPoint("engine."+s.features.EngineType+".mode."+engineMode))
+	}
+	if s.features.BrokerEnabled {
+		metrics = append(metrics, createPoint("broker."+s.features.BrokerType+".mode."+brokerMode))
+	}
+	if s.features.PresenceManagerEnabled {
+		metrics = append(metrics, createPoint("presence_manager."+s.features.PresenceManagerType+".mode."+presenceManagerMode))
 	}
 
 	if s.features.Websocket {
@@ -348,9 +375,6 @@ func (s *Sender) prepareMetrics() []*metric {
 	}
 	if s.features.SSE {
 		metrics = append(metrics, createPoint("transports_enabled.sse"))
-	}
-	if s.features.SockJS {
-		metrics = append(metrics, createPoint("transports_enabled.sockjs"))
 	}
 	if s.features.UniWebsocket {
 		metrics = append(metrics, createPoint("transports_enabled.uni_websocket"))
@@ -379,6 +403,18 @@ func (s *Sender) prepareMetrics() []*metric {
 	if s.features.RPCProxy {
 		metrics = append(metrics, createPoint("proxies_enabled.rpc"))
 	}
+	if s.features.SubRefreshProxy {
+		metrics = append(metrics, createPoint("proxies_enabled.sub_refresh"))
+	}
+	if s.features.SubscribeStreamProxy {
+		metrics = append(metrics, createPoint("proxies_enabled.subscribe_stream"))
+	}
+	if len(s.features.EnabledConsumers) > 0 {
+		metrics = append(metrics, createPoint("features_enabled.consumers"))
+	}
+	for _, consumerType := range s.features.EnabledConsumers {
+		metrics = append(metrics, createPoint("consumers_enabled."+consumerType))
+	}
 	if s.features.GrpcAPI {
 		metrics = append(metrics, createPoint("features_enabled.grpc_api"))
 	}
@@ -405,8 +441,8 @@ func (s *Sender) prepareMetrics() []*metric {
 	var usesPresence bool
 	var usesJoinLeave bool
 
-	namespaces := s.rules.Config().Namespaces
-	chOpts := s.rules.Config().ChannelOptions
+	namespaces := s.rules.Config().Channel.Namespaces
+	chOpts := s.rules.Config().Channel.WithoutNamespace
 	if chOpts.HistoryTTL > 0 && chOpts.HistorySize > 0 {
 		usesHistory = true
 	}
@@ -440,6 +476,11 @@ func (s *Sender) prepareMetrics() []*metric {
 	}
 
 	s.mu.RLock()
+	if s.maxNumNodes == 0 {
+		s.mu.RUnlock()
+		return nil, errors.New("no nodes found, skip sending")
+	}
+
 	numNodesMetric := getHistogramMetric(
 		s.maxNumNodes,
 		[]int{1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
@@ -450,8 +491,8 @@ func (s *Sender) prepareMetrics() []*metric {
 		s.maxNumClients,
 		[]int{
 			0, 5, 10, 100, 1000, 10000, 50000, 100000,
-			500000, 1000000, 5000000, 10000000, 50000000,
-			100000000,
+			500000, 1000000, 2000000, 3000000, 4000000,
+			5000000, 10000000, 50000000, 100000000,
 		},
 		"num_clients.",
 	)
@@ -460,8 +501,8 @@ func (s *Sender) prepareMetrics() []*metric {
 		s.maxNumChannels,
 		[]int{
 			0, 5, 10, 100, 1000, 10000, 50000, 100000,
-			500000, 1000000, 5000000, 10000000, 50000000,
-			100000000,
+			500000, 1000000, 2000000, 3000000, 4000000,
+			5000000, 10000000, 50000000, 100000000,
 		},
 		"num_channels.",
 	)
@@ -505,7 +546,7 @@ func (s *Sender) prepareMetrics() []*metric {
 		"num_rpc_namespaces.",
 	)
 	metrics = append(metrics, createPoint(numRpcNamespacesMetric))
-	return metrics
+	return metrics, nil
 }
 
 func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken string) error {
@@ -515,9 +556,9 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 	}
 
 	if s.isDev() {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: sending usage stats", map[string]interface{}{"payload": string(data)}))
+		log.Debug().Str("payload", string(data)).Msg("usage stats: sending usage stats")
 	} else {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelTrace, "usage stats: sending usage stats", map[string]interface{}{"payload": string(data)}))
+		log.Trace().Str("payload", string(data)).Msg("usage stats: sending usage stats")
 	}
 
 	client := &http.Client{
@@ -526,14 +567,14 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 
 	if statsEndpoint == "" {
 		if s.isDev() {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: skip sending due to empty endpoint", map[string]interface{}{}))
+			log.Debug().Msg("usage stats: skip sending due to empty endpoint")
 		}
 		return nil
 	}
 
 	if statsToken == "" {
 		if s.isDev() {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: skip sending due to empty token", map[string]interface{}{}))
+			log.Debug().Msg("usage stats: skip sending due to empty token")
 		}
 		return nil
 	}
@@ -550,7 +591,7 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 		req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(data))
 		if err != nil {
 			if s.isDev() {
-				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: can't create send request", map[string]interface{}{"error": err.Error()}))
+				log.Debug().Err(err).Msg("usage stats: can't create send request")
 			}
 			continue
 		}
@@ -560,16 +601,16 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 		resp, err := client.Do(req)
 		if err != nil {
 			if s.isDev() {
-				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: error sending request", map[string]interface{}{"error": err.Error()}))
+				log.Debug().Err(err).Msg("usage stats: error sending request")
 			}
 			continue
 		}
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			if s.isDev() {
-				s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "usage stats: unexpected response status code", map[string]interface{}{"status": resp.StatusCode}))
+				log.Debug().Int("status", resp.StatusCode).Msg("usage stats: unexpected response status code")
 			}
 			continue
 		}
@@ -582,4 +623,18 @@ func (s *Sender) sendUsageStats(metrics []*metric, statsEndpoint, statsToken str
 	}
 
 	return nil
+}
+
+func GetEnabledConsumers(consumers []consuming.ConsumerConfig) []string {
+	var enabledConsumers []string
+	for _, c := range consumers {
+		consumerType := c.Type
+		if c.Type == configtypes.ConsumerTypeKafka && c.Kafka.PublicationDataMode.Enabled {
+			consumerType += "_publication_data"
+		}
+		if c.Enabled && !slices.Contains(enabledConsumers, consumerType) {
+			enabledConsumers = append(enabledConsumers, consumerType)
+		}
+	}
+	return enabledConsumers
 }

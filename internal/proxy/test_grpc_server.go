@@ -3,7 +3,7 @@ package proxy
 import (
 	"context"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
 )
 
 type proxyGRPCTestServer struct {
@@ -177,9 +177,8 @@ func (p proxyGRPCTestServer) RPC(_ context.Context, _ *proxyproto.RPCRequest) (*
 
 func (p proxyGRPCTestServer) newDisconnect() *proxyproto.Disconnect {
 	return &proxyproto.Disconnect{
-		Code:      4000,
-		Reason:    "custom disconnect",
-		Reconnect: false,
+		Code:   4000,
+		Reason: "custom disconnect",
 	}
 }
 

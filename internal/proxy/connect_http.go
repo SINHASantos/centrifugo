@@ -2,24 +2,28 @@ package proxy
 
 import (
 	"context"
-	"time"
+	"fmt"
 
-	"github.com/centrifugal/centrifugo/v4/internal/proxyproto"
+	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
 )
 
 // HTTPConnectProxy ...
 type HTTPConnectProxy struct {
-	proxy      Proxy
+	config     Config
 	httpCaller HTTPCaller
 }
 
 var _ ConnectProxy = (*HTTPConnectProxy)(nil)
 
 // NewHTTPConnectProxy ...
-func NewHTTPConnectProxy(p Proxy) (*HTTPConnectProxy, error) {
+func NewHTTPConnectProxy(p Config) (*HTTPConnectProxy, error) {
+	httpClient, err := proxyHTTPClient(p, "connect_proxy")
+	if err != nil {
+		return nil, fmt.Errorf("error creating HTTP client: %w", err)
+	}
 	return &HTTPConnectProxy{
-		proxy:      p,
-		httpCaller: NewHTTPCaller(proxyHTTPClient(time.Duration(p.Timeout))),
+		config:     p,
+		httpCaller: NewHTTPCaller(httpClient),
 	}, nil
 }
 
@@ -28,9 +32,13 @@ func (p *HTTPConnectProxy) Protocol() string {
 	return "http"
 }
 
+func (p *HTTPConnectProxy) Name() string {
+	return "default"
+}
+
 // UseBase64 ...
 func (p *HTTPConnectProxy) UseBase64() bool {
-	return p.proxy.BinaryEncoding
+	return p.config.BinaryEncoding
 }
 
 // ProxyConnect proxies connect control to application backend.
@@ -39,9 +47,9 @@ func (p *HTTPConnectProxy) ProxyConnect(ctx context.Context, req *proxyproto.Con
 	if err != nil {
 		return nil, err
 	}
-	respData, err := p.httpCaller.CallHTTP(ctx, p.proxy.Endpoint, httpRequestHeaders(ctx, p.proxy), data)
+	respData, err := p.httpCaller.CallHTTP(ctx, p.config.Endpoint, httpRequestHeaders(ctx, p.config), data)
 	if err != nil {
-		return nil, err
+		return transformConnectResponse(err, p.config.HTTP.StatusToCodeTransforms)
 	}
 	return httpDecoder.DecodeConnectResponse(respData)
 }

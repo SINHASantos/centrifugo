@@ -70,83 +70,20 @@ type ResultEncoder interface {
 	EncodeChannels(*ChannelsResult) ([]byte, error)
 }
 
-var _ ResultEncoder = (*JSONResultEncoder)(nil)
-
-// JSONResultEncoder ...
-type JSONResultEncoder struct{}
-
-// NewJSONEncoder ...
-func NewJSONEncoder() *JSONResultEncoder {
-	return &JSONResultEncoder{}
-}
-
-// EncodePublish ...
-func (e *JSONResultEncoder) EncodePublish(res *PublishResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeBroadcast ...
-func (e *JSONResultEncoder) EncodeBroadcast(res *BroadcastResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeSubscribe ...
-func (e *JSONResultEncoder) EncodeSubscribe(res *SubscribeResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
-}
-
-// EncodeUnsubscribe ...
-func (e *JSONResultEncoder) EncodeUnsubscribe(res *UnsubscribeResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
-}
-
-// EncodeDisconnect ...
-func (e *JSONResultEncoder) EncodeDisconnect(res *DisconnectResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
-}
-
-// EncodePresence ...
-func (e *JSONResultEncoder) EncodePresence(res *PresenceResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodePresenceStats ...
-func (e *JSONResultEncoder) EncodePresenceStats(res *PresenceStatsResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeHistory ...
-func (e *JSONResultEncoder) EncodeHistory(res *HistoryResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeHistoryRemove ...
-func (e *JSONResultEncoder) EncodeHistoryRemove(res *HistoryRemoveResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
-}
-
-// EncodeInfo ...
-func (e *JSONResultEncoder) EncodeInfo(res *InfoResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeRPC ...
-func (e *JSONResultEncoder) EncodeRPC(res *RPCResult) ([]byte, error) {
-	return json.Marshal(res)
-}
-
-// EncodeRefresh ...
-func (e *JSONResultEncoder) EncodeRefresh(res *RefreshResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
-}
-
-// EncodeChannels ...
-func (e *JSONResultEncoder) EncodeChannels(res *ChannelsResult) ([]byte, error) {
-	//nolint:staticcheck
-	return json.Marshal(res)
+// ResponseEncoder ...
+type ResponseEncoder interface {
+	EncodePublish(*PublishResponse) ([]byte, error)
+	EncodeBroadcast(*BroadcastResponse) ([]byte, error)
+	EncodeSubscribe(*SubscribeResponse) ([]byte, error)
+	EncodeUnsubscribe(*UnsubscribeResponse) ([]byte, error)
+	EncodeDisconnect(*DisconnectResponse) ([]byte, error)
+	EncodePresence(*PresenceResponse) ([]byte, error)
+	EncodePresenceStats(*PresenceStatsResponse) ([]byte, error)
+	EncodeHistory(*HistoryResponse) ([]byte, error)
+	EncodeHistoryRemove(*HistoryRemoveResponse) ([]byte, error)
+	EncodeInfo(*InfoResponse) ([]byte, error)
+	EncodeRPC(*RPCResponse) ([]byte, error)
+	EncodeRefresh(*RefreshResponse) ([]byte, error)
+	EncodeChannels(*ChannelsResponse) ([]byte, error)
+	EncodeBatch(response *BatchResponse) ([]byte, error)
 }

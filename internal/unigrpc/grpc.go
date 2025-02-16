@@ -1,14 +1,15 @@
 package unigrpc
 
 import (
-	"errors"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/unigrpc/unistream"
+	"github.com/centrifugal/centrifugo/v6/internal/logging"
+	"github.com/centrifugal/centrifugo/v6/internal/unigrpc/unistream"
 
 	"github.com/centrifugal/centrifuge"
+	"github.com/centrifugal/protocol"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
 
 // RegisterService ...
@@ -26,9 +27,6 @@ type Service struct {
 
 // NewService creates new Service.
 func NewService(n *centrifuge.Node, c Config) *Service {
-	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = centrifuge.ProtocolVersion1
-	}
 	return &Service{
 		config: c,
 		node:   n,
@@ -37,38 +35,20 @@ func NewService(n *centrifuge.Node, c Config) *Service {
 
 // Consume is a unidirectional server->client stream with real-time data.
 func (s *Service) Consume(req *unistream.ConnectRequest, stream unistream.CentrifugoUniStream_ConsumeServer) error {
-	protoVersion := s.config.ProtocolVersion
-	if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
-		mdProtocolVersion := md.Get("x-cf-protocol-version")
-		if len(mdProtocolVersion) == 1 {
-			queryProtocolVersion := mdProtocolVersion[0]
-			if queryProtocolVersion != "" {
-				switch queryProtocolVersion {
-				case "v1":
-					protoVersion = centrifuge.ProtocolVersion1
-				case "v2":
-					protoVersion = centrifuge.ProtocolVersion2
-				default:
-					s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelInfo, "unknown protocol version", map[string]interface{}{"transport": transportName, "version": queryProtocolVersion}))
-					return errors.New("unknown protocol version")
-				}
-			}
-		}
-	}
-
 	streamDataCh := make(chan rawFrame)
-	transport := newGRPCTransport(stream, streamDataCh, protoVersion)
+	transport := newGRPCTransport(stream, streamDataCh)
 
-	connectRequest := centrifuge.ConnectRequest{
+	connectRequest := &protocol.ConnectRequest{
 		Token:   req.Token,
 		Data:    req.Data,
 		Name:    req.Name,
 		Version: req.Version,
+		Headers: req.Headers,
 	}
 	if req.Subs != nil {
-		subs := make(map[string]centrifuge.SubscribeRequest, len(req.Subs))
+		subs := make(map[string]*protocol.SubscribeRequest, len(req.Subs))
 		for k, v := range req.Subs {
-			subs[k] = centrifuge.SubscribeRequest{
+			subs[k] = &protocol.SubscribeRequest{
 				Recover: v.Recover,
 				Offset:  v.Offset,
 				Epoch:   v.Epoch,
@@ -83,14 +63,15 @@ func (s *Service) Consume(req *unistream.ConnectRequest, stream unistream.Centri
 	}
 	defer func() { _ = closeFn() }()
 
-	if s.node.LogEnabled(centrifuge.LogLevelDebug) {
-		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection established", map[string]interface{}{"transport": transport.Name(), "client": c.ID()}))
+	if logging.Enabled(logging.DebugLevel) {
+		log.Debug().Str("transport", transport.Name()).Str("client", c.ID()).Msg("client connection established")
 		defer func(started time.Time) {
-			s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "client connection completed", map[string]interface{}{"duration": time.Since(started), "transport": transport.Name(), "client": c.ID()}))
+			log.Debug().Str("transport", transport.Name()).Str("client", c.ID()).
+				Str("duration", time.Since(started).String()).Msg("client connection completed")
 		}(time.Now())
 	}
 
-	c.Connect(connectRequest)
+	c.ProtocolConnect(connectRequest)
 
 	for {
 		select {

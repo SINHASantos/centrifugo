@@ -8,17 +8,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/centrifugal/centrifugo/v4/internal/jwks"
-	"github.com/centrifugal/centrifugo/v4/internal/rule"
-	"github.com/centrifugal/centrifugo/v4/internal/subsource"
+	"github.com/centrifugal/centrifugo/v6/internal/config"
+	"github.com/centrifugal/centrifugo/v6/internal/jwks"
+	"github.com/centrifugal/centrifugo/v6/internal/subsource"
 
 	"github.com/centrifugal/centrifuge"
-	"github.com/cristalhq/jwt/v4"
+	"github.com/cristalhq/jwt/v5"
+	"github.com/rakutentech/jwk-go/okp"
 	"github.com/rs/zerolog/log"
+	"github.com/tidwall/gjson"
 )
 
 type VerifierConfig struct {
@@ -43,41 +46,89 @@ type VerifierConfig struct {
 	// https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3.
 	Audience string
 
+	// AudienceRegex allows setting Audience in form of Go language regex pattern. Regex groups
+	// may be then used in constructing JWKSPublicEndpoint.
+	AudienceRegex string
+
 	// Issuer when set will enable a check that token issuer matches configured string.
 	// See https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.1.
 	Issuer string
+
+	// IssuerRegex allows setting Issuer in form of Go language regex pattern. Regex groups
+	// may be then used in constructing JWKSPublicEndpoint.
+	IssuerRegex string
+
+	// UserIDClaim allows overriding default claim used to extract user ID from token.
+	// By default, Centrifugo uses "sub" and we recommend keeping the default if possible.
+	UserIDClaim string
 }
 
-func NewTokenVerifierJWT(config VerifierConfig, ruleContainer *rule.Container) *VerifierJWT {
+func (c VerifierConfig) Validate() error {
+	if c.Audience != "" && c.AudienceRegex != "" {
+		return errors.New("can not use both token_audience and token_audience_regex, configure only one of them")
+	}
+	if c.Issuer != "" && c.IssuerRegex != "" {
+		return errors.New("can not use both token_issuer and token_issuer_regex, configure only one of them")
+	}
+	return nil
+}
+
+func NewTokenVerifierJWT(config VerifierConfig, cfgContainer *config.Container) (*VerifierJWT, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("error validating token verifier config: %w", err)
+	}
+	var audienceRe *regexp.Regexp
+	var issuerRe *regexp.Regexp
+	var err error
+	if config.AudienceRegex != "" {
+		audienceRe, err = regexp.Compile(config.AudienceRegex)
+		if err != nil {
+			return nil, fmt.Errorf("error compiling audience regex: %w", err)
+		}
+	}
+	if config.IssuerRegex != "" {
+		issuerRe, err = regexp.Compile(config.IssuerRegex)
+		if err != nil {
+			return nil, fmt.Errorf("error compiling issuer regex: %w", err)
+		}
+	}
+
 	verifier := &VerifierJWT{
-		ruleContainer: ruleContainer,
-		issuer:        config.Issuer,
-		audience:      config.Audience,
+		cfgContainer: cfgContainer,
+		issuer:       config.Issuer,
+		issuerRe:     issuerRe,
+		audience:     config.Audience,
+		audienceRe:   audienceRe,
+		userIDClaim:  config.UserIDClaim,
 	}
 
 	algorithms, err := newAlgorithms(config.HMACSecretKey, config.RSAPublicKey, config.ECDSAPublicKey)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("error initializing token algorithms: %w", err)
 	}
 	verifier.algorithms = algorithms
 
 	if config.JWKSPublicEndpoint != "" {
 		mng, err := jwks.NewManager(config.JWKSPublicEndpoint)
-		if err == nil {
-			verifier.jwksManager = &jwksManager{mng}
+		if err != nil {
+			return nil, fmt.Errorf("error creating JWK manager: %w", err)
 		}
+		verifier.jwksManager = &jwksManager{mng}
 	}
 
-	return verifier
+	return verifier, nil
 }
 
 type VerifierJWT struct {
-	mu            sync.RWMutex
-	jwksManager   *jwksManager
-	algorithms    *algorithms
-	ruleContainer *rule.Container
-	audience      string
-	issuer        string
+	mu           sync.RWMutex
+	jwksManager  *jwksManager
+	algorithms   *algorithms
+	cfgContainer *config.Container
+	audience     string
+	audienceRe   *regexp.Regexp
+	issuer       string
+	issuerRe     *regexp.Regexp
+	userIDClaim  string
 }
 
 var (
@@ -151,34 +202,63 @@ type SubscribeTokenClaims struct {
 
 type jwksManager struct{ *jwks.Manager }
 
-func (j *jwksManager) verify(token *jwt.Token) error {
+func (j *jwksManager) verify(token *jwt.Token, tokenVars map[string]any) error {
 	kid := token.Header().KeyID
 
-	key, err := j.Manager.FetchKey(context.Background(), kid)
+	key, err := j.Manager.FetchKey(context.Background(), kid, tokenVars)
 	if err != nil {
 		return err
 	}
 
-	if key.Kty != "RSA" {
+	if key.Kty != "RSA" && key.Kty != "EC" && key.Kty != "OKP" {
 		return errUnsupportedAlgorithm
 	}
 
 	spec, err := key.ParseKeySpec()
 	if err != nil {
-		return err
+		return fmt.Errorf("error parsing key spec: %w", err)
 	}
 
-	pubKey, ok := spec.Key.(*rsa.PublicKey)
-	if !ok {
-		return errPublicKeyInvalid
-	}
+	switch key.Kty {
+	case "RSA":
+		pubKey, ok := spec.Key.(*rsa.PublicKey)
+		if !ok {
+			return errPublicKeyInvalid
+		}
 
-	verifier, err := jwt.NewVerifierRS(jwt.Algorithm(spec.Algorithm), pubKey)
-	if err != nil {
-		return fmt.Errorf("%w: %s", errUnsupportedAlgorithm, spec.Algorithm)
-	}
+		verifier, err := jwt.NewVerifierRS(jwt.Algorithm(spec.Algorithm), pubKey)
+		if err != nil {
+			return fmt.Errorf("%w: %s", errUnsupportedAlgorithm, spec.Algorithm)
+		}
 
-	return verifier.Verify(token)
+		return verifier.Verify(token)
+	case "EC":
+		pubKey, ok := spec.Key.(*ecdsa.PublicKey)
+		if !ok {
+			return errPublicKeyInvalid
+		}
+
+		verifier, err := jwt.NewVerifierES(jwt.Algorithm(spec.Algorithm), pubKey)
+		if err != nil {
+			return fmt.Errorf("%w: %s", errUnsupportedAlgorithm, spec.Algorithm)
+		}
+
+		return verifier.Verify(token)
+	case "OKP":
+		pubKey, ok := spec.Key.(okp.Ed25519)
+		if !ok {
+			return errPublicKeyInvalid
+		}
+
+		verifier, err := jwt.NewVerifierEdDSA(pubKey.PublicKey())
+		if err != nil {
+			return errUnsupportedAlgorithm
+		}
+
+		return verifier.Verify(token)
+	default:
+		return errUnsupportedAlgorithm
+	}
 }
 
 type algorithms struct {
@@ -221,7 +301,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 	// RSA.
 	if rsaPubKey != nil {
 		if verifierRS256, err := jwt.NewVerifierRS(jwt.RS256, rsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -229,7 +309,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 			algorithms = append(algorithms, "RS256")
 		}
 		if verifierRS384, err := jwt.NewVerifierRS(jwt.RS384, rsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -237,7 +317,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 			algorithms = append(algorithms, "RS384")
 		}
 		if verifierRS512, err := jwt.NewVerifierRS(jwt.RS512, rsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -249,7 +329,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 	// ECDSA.
 	if ecdsaPubKey != nil {
 		if verifierES256, err := jwt.NewVerifierES(jwt.ES256, ecdsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -257,7 +337,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 			algorithms = append(algorithms, "ES256")
 		}
 		if verifierES384, err := jwt.NewVerifierES(jwt.ES384, ecdsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -265,7 +345,7 @@ func newAlgorithms(tokenHMACSecretKey string, rsaPubKey *rsa.PublicKey, ecdsaPub
 			algorithms = append(algorithms, "ES384")
 		}
 		if verifierES512, err := jwt.NewVerifierES(jwt.ES512, ecdsaPubKey); err != nil {
-			if err != jwt.ErrInvalidKey {
+			if !errors.Is(err, jwt.ErrInvalidKey) {
 				return nil, err
 			}
 		} else {
@@ -318,25 +398,15 @@ func (verifier *VerifierJWT) verifySignature(token *jwt.Token) error {
 	return verifier.algorithms.verify(token)
 }
 
-func (verifier *VerifierJWT) verifySignatureByJWK(token *jwt.Token) error {
+func (verifier *VerifierJWT) verifySignatureByJWK(token *jwt.Token, tokenVars map[string]any) error {
 	verifier.mu.RLock()
 	defer verifier.mu.RUnlock()
 
-	return verifier.jwksManager.verify(token)
+	return verifier.jwksManager.verify(token, tokenVars)
 }
 
-func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) {
+func (verifier *VerifierJWT) VerifyConnectToken(t string, skipVerify bool) (ConnectToken, error) {
 	token, err := jwt.ParseNoVerify([]byte(t)) // Will be verified later.
-	if err != nil {
-		return ConnectToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
-	}
-
-	if verifier.jwksManager != nil {
-		err = verifier.verifySignatureByJWK(token)
-	} else {
-		err = verifier.verifySignature(token)
-	}
-
 	if err != nil {
 		return ConnectToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
@@ -346,8 +416,62 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 		return ConnectToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
+	if verifier.audience != "" && !claims.IsForAudience(verifier.audience) {
+		return ConnectToken{}, fmt.Errorf("%w: invalid audience", ErrInvalidToken)
+	}
+
+	if verifier.issuer != "" && !claims.IsIssuer(verifier.issuer) {
+		return ConnectToken{}, fmt.Errorf("%w: invalid issuer", ErrInvalidToken)
+	}
+
+	tokenVars := map[string]any{}
+
+	if verifier.issuerRe != nil {
+		match := verifier.issuerRe.FindStringSubmatch(claims.Issuer)
+		if len(match) == 0 {
+			return ConnectToken{}, fmt.Errorf("%w: issuer not matched", ErrInvalidToken)
+		}
+		for i, name := range verifier.issuerRe.SubexpNames() {
+			if i != 0 && name != "" {
+				tokenVars[name] = match[i]
+			}
+		}
+	}
+
+	if verifier.audienceRe != nil {
+		matched := false
+		for _, audience := range claims.Audience {
+			match := verifier.audienceRe.FindStringSubmatch(audience)
+			if len(match) == 0 {
+				continue
+			}
+			matched = true
+			for i, name := range verifier.audienceRe.SubexpNames() {
+				if i != 0 && name != "" {
+					tokenVars[name] = match[i]
+				}
+			}
+			break
+		}
+		if !matched {
+			return ConnectToken{}, fmt.Errorf("%w: audience not matched", ErrInvalidToken)
+		}
+	}
+
+	if !skipVerify {
+		if verifier.jwksManager != nil {
+			err = verifier.verifySignatureByJWK(token, tokenVars)
+		} else {
+			err = verifier.verifySignature(token)
+		}
+		if err != nil {
+			return ConnectToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+		}
+	}
+
 	if claims.Channel != "" {
-		return ConnectToken{}, ErrInvalidToken
+		return ConnectToken{}, fmt.Errorf(
+			"%w: connection JWT can not contain channel claim, only subscription JWT can", ErrInvalidToken)
 	}
 
 	now := time.Now()
@@ -355,19 +479,11 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 		return ConnectToken{}, ErrTokenExpired
 	}
 
-	if verifier.audience != "" && !claims.IsForAudience(verifier.audience) {
-		return ConnectToken{}, ErrInvalidToken
-	}
-
-	if verifier.issuer != "" && !claims.IsIssuer(verifier.issuer) {
-		return ConnectToken{}, ErrInvalidToken
-	}
-
 	subs := map[string]centrifuge.SubscribeOptions{}
 
 	if len(claims.Subs) > 0 {
 		for ch, v := range claims.Subs {
-			_, _, chOpts, found, err := verifier.ruleContainer.ChannelOptions(ch)
+			_, _, chOpts, found, err := verifier.cfgContainer.ChannelOptions(ch)
 			if err != nil {
 				return ConnectToken{}, err
 			}
@@ -414,6 +530,7 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 			if v.Override != nil && v.Override.ForcePositioning != nil {
 				positioning = v.Override.ForcePositioning.Value
 			}
+			recoveryMode := chOpts.GetRecoveryMode()
 			subs[ch] = centrifuge.SubscribeOptions{
 				ChannelInfo:       info,
 				EmitPresence:      presence,
@@ -421,13 +538,16 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 				PushJoinLeave:     pushJoinLeave,
 				EnableRecovery:    recovery,
 				EnablePositioning: positioning,
+				RecoveryMode:      recoveryMode,
 				Data:              data,
 				Source:            subsource.ConnectionToken,
+				HistoryMetaTTL:    chOpts.HistoryMetaTTL.ToDuration(),
+				AllowedDeltaTypes: chOpts.AllowedDeltaTypes,
 			}
 		}
 	} else if len(claims.Channels) > 0 {
 		for _, ch := range claims.Channels {
-			_, _, chOpts, found, err := verifier.ruleContainer.ChannelOptions(ch)
+			_, _, chOpts, found, err := verifier.cfgContainer.ChannelOptions(ch)
 			if err != nil {
 				return ConnectToken{}, err
 			}
@@ -440,7 +560,10 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 				PushJoinLeave:     chOpts.ForcePushJoinLeave,
 				EnableRecovery:    chOpts.ForceRecovery,
 				EnablePositioning: chOpts.ForcePositioning,
+				RecoveryMode:      chOpts.GetRecoveryMode(),
 				Source:            subsource.ConnectionToken,
+				HistoryMetaTTL:    chOpts.HistoryMetaTTL.ToDuration(),
+				AllowedDeltaTypes: chOpts.AllowedDeltaTypes,
 			}
 		}
 	}
@@ -468,27 +591,22 @@ func (verifier *VerifierJWT) VerifyConnectToken(t string) (ConnectToken, error) 
 	}
 
 	ct := ConnectToken{
-		UserID:   claims.RegisteredClaims.Subject,
 		Info:     info,
 		Subs:     subs,
 		ExpireAt: expireAt,
 		Meta:     claims.Meta,
 	}
-
+	if verifier.userIDClaim != "" {
+		value := gjson.GetBytes(token.Claims(), verifier.userIDClaim)
+		ct.UserID = value.String()
+	} else {
+		ct.UserID = claims.RegisteredClaims.Subject
+	}
 	return ct, nil
 }
 
-func (verifier *VerifierJWT) VerifySubscribeToken(t string) (SubscribeToken, error) {
+func (verifier *VerifierJWT) VerifySubscribeToken(t string, skipVerify bool) (SubscribeToken, error) {
 	token, err := jwt.ParseNoVerify([]byte(t)) // Will be verified later.
-	if err != nil {
-		return SubscribeToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
-	}
-
-	if verifier.jwksManager != nil {
-		err = verifier.verifySignatureByJWK(token)
-	} else {
-		err = verifier.verifySignature(token)
-	}
 	if err != nil {
 		return SubscribeToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
@@ -498,24 +616,69 @@ func (verifier *VerifierJWT) VerifySubscribeToken(t string) (SubscribeToken, err
 		return SubscribeToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
+	if verifier.audience != "" && !claims.IsForAudience(verifier.audience) {
+		return SubscribeToken{}, fmt.Errorf("%w: invalid audience", ErrInvalidToken)
+	}
+
+	if verifier.issuer != "" && !claims.IsIssuer(verifier.issuer) {
+		return SubscribeToken{}, fmt.Errorf("%w: invalid issuer", ErrInvalidToken)
+	}
+
+	tokenVars := map[string]any{}
+
+	if verifier.issuerRe != nil {
+		match := verifier.issuerRe.FindStringSubmatch(claims.Issuer)
+		if len(match) == 0 {
+			return SubscribeToken{}, fmt.Errorf("%w: issuer not matched", ErrInvalidToken)
+		}
+		for i, name := range verifier.issuerRe.SubexpNames() {
+			if i != 0 && name != "" {
+				tokenVars[name] = match[i]
+			}
+		}
+	}
+
+	if verifier.audienceRe != nil {
+		matched := false
+		for _, audience := range claims.Audience {
+			match := verifier.audienceRe.FindStringSubmatch(audience)
+			if len(match) == 0 {
+				continue
+			}
+			matched = true
+			for i, name := range verifier.audienceRe.SubexpNames() {
+				if i != 0 && name != "" {
+					tokenVars[name] = match[i]
+				}
+			}
+			break
+		}
+		if !matched {
+			return SubscribeToken{}, fmt.Errorf("%w: audience not matched", ErrInvalidToken)
+		}
+	}
+
+	if !skipVerify {
+		if verifier.jwksManager != nil {
+			err = verifier.verifySignatureByJWK(token, tokenVars)
+		} else {
+			err = verifier.verifySignature(token)
+		}
+		if err != nil {
+			return SubscribeToken{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+		}
+	}
+
 	now := time.Now()
 	if !claims.IsValidExpiresAt(now) || !claims.IsValidNotBefore(now) {
 		return SubscribeToken{}, ErrTokenExpired
 	}
 
-	if verifier.audience != "" && !claims.IsForAudience(verifier.audience) {
-		return SubscribeToken{}, ErrInvalidToken
-	}
-
-	if verifier.issuer != "" && !claims.IsIssuer(verifier.issuer) {
-		return SubscribeToken{}, ErrInvalidToken
-	}
-
 	if claims.Channel == "" {
-		return SubscribeToken{}, ErrInvalidToken
+		return SubscribeToken{}, fmt.Errorf("%w: channel claim is required for subscription JWT", ErrInvalidToken)
 	}
 
-	_, _, chOpts, found, err := verifier.ruleContainer.ChannelOptions(claims.Channel)
+	_, _, chOpts, found, err := verifier.cfgContainer.ChannelOptions(claims.Channel)
 	if err != nil {
 		return SubscribeToken{}, err
 	}
@@ -562,6 +725,7 @@ func (verifier *VerifierJWT) VerifySubscribeToken(t string) (SubscribeToken, err
 	if claims.Override != nil && claims.Override.ForcePositioning != nil {
 		positioning = claims.Override.ForcePositioning.Value
 	}
+	recoveryMode := chOpts.GetRecoveryMode()
 
 	var expireAt int64
 	if claims.ExpireAt != nil {
@@ -586,21 +750,52 @@ func (verifier *VerifierJWT) VerifySubscribeToken(t string) (SubscribeToken, err
 			PushJoinLeave:     pushJoinLeave,
 			EnableRecovery:    recovery,
 			EnablePositioning: positioning,
+			RecoveryMode:      recoveryMode,
+			AllowedDeltaTypes: chOpts.AllowedDeltaTypes,
 			Data:              data,
 		},
+	}
+	if verifier.userIDClaim != "" {
+		value := gjson.GetBytes(token.Claims(), verifier.userIDClaim)
+		st.UserID = value.String()
+	} else {
+		st.UserID = claims.RegisteredClaims.Subject
 	}
 	return st, nil
 }
 
 func (verifier *VerifierJWT) Reload(config VerifierConfig) error {
+	if err := config.Validate(); err != nil {
+		return fmt.Errorf("error validating token verifier config: %w", err)
+	}
+
 	verifier.mu.Lock()
 	defer verifier.mu.Unlock()
+
 	alg, err := newAlgorithms(config.HMACSecretKey, config.RSAPublicKey, config.ECDSAPublicKey)
 	if err != nil {
 		return err
 	}
+
+	var audienceRe *regexp.Regexp
+	var issuerRe *regexp.Regexp
+	if config.AudienceRegex != "" {
+		audienceRe, err = regexp.Compile(config.AudienceRegex)
+		if err != nil {
+			return fmt.Errorf("error compiling audience regex: %w", err)
+		}
+	}
+	if config.IssuerRegex != "" {
+		issuerRe, err = regexp.Compile(config.IssuerRegex)
+		if err != nil {
+			return fmt.Errorf("error compiling issuer regex: %w", err)
+		}
+	}
 	verifier.algorithms = alg
 	verifier.audience = config.Audience
+	verifier.audienceRe = audienceRe
 	verifier.issuer = config.Issuer
+	verifier.issuerRe = issuerRe
+	verifier.userIDClaim = config.UserIDClaim
 	return nil
 }

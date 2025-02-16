@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/centrifugal/centrifuge"
+	"github.com/centrifugal/protocol"
 	"github.com/gorilla/websocket"
 )
 
@@ -14,19 +15,19 @@ type websocketTransport struct {
 	mu        sync.RWMutex
 	writeMu   sync.Mutex // sync general write with unidirectional ping write.
 	conn      *websocket.Conn
-	closed    bool
 	closeCh   chan struct{}
 	graceCh   chan struct{}
 	opts      websocketTransportOptions
 	pingTimer *time.Timer
+	closed    bool
 }
 
 type websocketTransportOptions struct {
 	pingInterval       time.Duration
 	writeTimeout       time.Duration
 	compressionMinSize int
-	protoVersion       centrifuge.ProtocolVersion
 	pingPongConfig     centrifuge.PingPongConfig
+	joinMessages       bool
 }
 
 func newWebsocketTransport(conn *websocket.Conn, opts websocketTransportOptions, graceCh chan struct{}) *websocketTransport {
@@ -47,13 +48,6 @@ func (t *websocketTransport) ping() {
 	case <-t.closeCh:
 		return
 	default:
-		if t.ProtocolVersion() == centrifuge.ProtocolVersion1 {
-			err := t.writeData([]byte(""))
-			if err != nil {
-				_ = t.Close(centrifuge.DisconnectWriteError)
-				return
-			}
-		}
 		deadline := time.Now().Add(t.opts.pingInterval / 2)
 		err := t.conn.WriteControl(websocket.PingMessage, nil, deadline)
 		if err != nil {
@@ -88,7 +82,7 @@ func (t *websocketTransport) Protocol() centrifuge.ProtocolType {
 
 // ProtocolVersion returns transport protocol version.
 func (t *websocketTransport) ProtocolVersion() centrifuge.ProtocolVersion {
-	return t.opts.protoVersion
+	return centrifuge.ProtocolVersion2
 }
 
 // Unidirectional returns whether transport is unidirectional.
@@ -101,11 +95,9 @@ func (t *websocketTransport) DisabledPushFlags() uint64 {
 	return 0
 }
 
-// AppLevelPing ...
-func (t *websocketTransport) AppLevelPing() centrifuge.AppLevelPing {
-	return centrifuge.AppLevelPing{
-		PingInterval: t.opts.pingPongConfig.PingInterval,
-	}
+// PingPongConfig ...
+func (t *websocketTransport) PingPongConfig() centrifuge.PingPongConfig {
+	return t.opts.pingPongConfig
 }
 
 // Emulation ...
@@ -139,6 +131,19 @@ func (t *websocketTransport) writeData(data []byte) error {
 	return nil
 }
 
+func (t *websocketTransport) writeMany(messages ...[]byte) error {
+	protoType := protocol.TypeJSON
+	if t.Protocol() == centrifuge.ProtocolTypeProtobuf {
+		protoType = protocol.TypeProtobuf
+	}
+	encoder := protocol.GetDataEncoder(protoType)
+	defer protocol.PutDataEncoder(protoType, encoder)
+	for i := range messages {
+		_ = encoder.Encode(messages[i])
+	}
+	return t.writeData(encoder.Finish())
+}
+
 // Write data to transport.
 func (t *websocketTransport) Write(message []byte) error {
 	return t.WriteMany(message)
@@ -150,10 +155,22 @@ func (t *websocketTransport) WriteMany(messages ...[]byte) error {
 	case <-t.closeCh:
 		return nil
 	default:
-		for i := 0; i < len(messages); i++ {
-			err := t.writeData(messages[i])
+		var err error
+		if t.opts.joinMessages {
+			if len(messages) == 1 && t.Protocol() == centrifuge.ProtocolTypeJSON {
+				// Fast path for one JSON message.
+				return t.writeData(messages[0])
+			}
+			err = t.writeMany(messages...)
 			if err != nil {
 				return err
+			}
+		} else {
+			for i := 0; i < len(messages); i++ {
+				err = t.writeData(messages[i])
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return nil

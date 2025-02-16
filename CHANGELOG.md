@@ -1,3 +1,142 @@
+v5.1.2 and higher
+=================
+
+Since Centrifugo v5.1.2 we do not maintain CHANGELOG.md file.
+
+All changes may be found on [Centrifugo releases page](https://github.com/centrifugal/centrifugo/releases) on Github.
+
+v5.1.1
+======
+
+### Improvements
+
+* Option to extract client connection user ID from HTTP header [#730](https://github.com/centrifugal/centrifugo/pull/730). See [documentation](https://centrifugal.dev/docs/server/configuration#client_user_id_http_header) for it.
+* Speed up channel config operations by using atomic.Value and reduce allocations upon channel namespace extraction by using channel options cache, [#727](https://github.com/centrifugal/centrifugo/pull/727)
+* New metrics for the size of messages sent and received by Centrifugo real-time transport. And we finally described all the metrics exposed by Centrifugo in docs - see [Server observability -> Exposed metrics](https://centrifugal.dev/docs/server/observability#exposed-metrics)
+
+### Fixes
+
+* Fix `Lua redis lib command arguments must be strings or integers script` error when calling Redis reversed history and the stream metadata key does not exist, [#732](https://github.com/centrifugal/centrifugo/issues/732)
+
+### Misc
+
+* Dependencies updated (rueidis, quic-go, etc)
+* Improved logging for bidirectional emulation transports and unidirectional transports - avoid unnecessary error logs
+
+v5.1.0
+======
+
+### Improvements
+
+* Support for EC keys in JWK sets and EC JWTs when using JWKS [#720](https://github.com/centrifugal/centrifugo/pull/720) by @shaunco, [JWKS docs updated](https://centrifugal.dev/docs/server/authentication#json-web-key-support)
+* Experimental GRPC proxy subscription streams [#722](https://github.com/centrifugal/centrifugo/pull/722) - this is like [Websocketd](https://github.com/joewalnes/websocketd) but on network steroids 🔥. Streaming request semantics - both unidirectional and bidirectional – is now super-simple to achieve with Centrifugo and GRPC. See additional details about motivation, design, scalability concerns and basic examples in [docs](https://centrifugal.dev/docs/server/proxy_streams)
+* Transport error mode for server HTTP and GRPC APIs [#690](https://github.com/centrifugal/centrifugo/pull/690) - read [more in docs](https://centrifugal.dev/docs/server/server_api#transport-error-mode)
+* Support GRPC gzip compression [#723](https://github.com/centrifugal/centrifugo/pull/723). GRPC servers Centrifugo has now recognize gzip compression, proxy requests can optionally use compression for calls (see [updated proxy docs](https://centrifugal.dev/docs/server/proxy)).
+
+### Misc
+
+* Release is built with Go 1.21.3
+* Dependencies updated (crypto, otel, msgpack, etc)
+
+v5.0.4
+======
+
+### Improvements
+
+* Support `expire_at` field of SubscribeResult from Subscribe Proxy [#707](https://github.com/centrifugal/centrifugo/pull/707)
+* Option to skip client token signature verification [#708](https://github.com/centrifugal/centrifugo/pull/708)
+
+### Fixes
+
+* Fix connecting to Redis server over unix socket - inherited from [centrifugal/centrifuge#318](https://github.com/centrifugal/centrifuge/pull/318) by @tie
+
+### Misc
+
+* Release is built with Go 1.21.1
+* Dependencies updated (centrifuge, quic-go, grpc, and others)
+
+v5.0.3
+======
+
+### Improvements
+
+* Add support for GRPC exporter protocol in opentelemetry tracing, by @SinimaWath in [#691](https://github.com/centrifugal/centrifugo/pull/691)
+
+### Misc
+
+* Release is built with Go 1.20.7
+* Dependencies updated (rueidis, quic-go, opentelemetry, etc)
+
+v5.0.2
+======
+
+### Improvements
+
+* Quiet mode and no expiration for gentoken/gensubtoken cli commands [#681](https://github.com/centrifugal/centrifugo/pull/681) - so token generation using cli helpers is more flexible now
+* Add `proxy_static_http_headers` option and `static_http_headers` key for granular proxy [#687](https://github.com/centrifugal/centrifugo/pull/687) - so it's possible to append custom headers to HTTP proxy requests.
+
+### Fixes
+
+* Suppress warnings about k8s env vars, see [issue](https://github.com/centrifugal/centrifugo/issues/678)
+
+### Misc
+
+* Release is built with Go 1.20.7
+* Dependencies updated (rueidis, quic-go, crypto, etc)
+* Replace `interface{}` with `any` in code base, [#682](https://github.com/centrifugal/centrifugo/pull/682)
+
+v5.0.1
+======
+
+* Fix panic upon subscription token validation caused by nil interface comparison, [commit](https://github.com/centrifugal/centrifugo/commit/fe2a92da24d1e8a473e559224fc5c87895713f6a)
+
+v5.0.0
+======
+
+In Centrifugo v5 we're phasing out old client protocol support, introducing a more intuitive HTTP API, adjusting token management behaviour in SDKs, improving configuration process, and refactoring the history meta ttl option. As the result you get a cleaner, more user-friendly, and optimized Centrifugo experience.
+
+All the major details about the release may be found in [Centrifugo v5 release announcement](https://centrifugal.dev/blog/2023/06/29/centrifugo-v5-released) in our blog.
+
+We also prepared [Centrifugo v5 migration guide](https://centrifugal.dev/docs/getting-started/migration_v5) which has more specific details about changes.
+
+v4.1.3
+======
+
+### Improvements
+
+* Dynamic JWKS endpoint based on iss and aud – implemented in [#638](https://github.com/centrifugal/centrifugo/pull/638), [documented here](https://centrifugal.dev/docs/server/authentication#dynamic-jwks-endpoint)
+* Add [redis_force_resp2](https://centrifugal.dev/docs/server/engines#redis_force_resp2) option, [#641](https://github.com/centrifugal/centrifugo/pull/641)
+* Document [client_stale_close_delay](https://centrifugal.dev/docs/server/configuration#client_stale_close_delay), make it 10 sec  instead of 25 sec by default, relates [#639](https://github.com/centrifugal/centrifugo/issues/639)
+
+### Misc
+
+* This release is built with Go 1.20.3
+
+v4.1.2
+======
+
+### Fixes
+
+* Fix decoding of large protocol messages. The bug was introduced by v4.1.1. See [bug report](https://github.com/centrifugal/centrifugo/issues/603)
+
+v4.1.1
+======
+
+### Improvements
+
+* Possibility to disable client protocol v1 using `disable_client_protocol_v1` boolean option. To remind you about client protocol v1 vs v2 migration in Centrifugo v4 take a look at [v3 to v4 migration guide](https://centrifugal.dev/docs/getting-started/migration_v4#client-sdk-migration). Centrifugo v4 uses client protocol v2 by default, all our recent SDKs only support client protocol v2. So if you are using modern stack then you can disable clients to use outdated protocol v1 right now. In Centrifugo v5 support for client protocol v1 will be completely removed, see [Centrifugo v5 roadmap](https://github.com/centrifugal/centrifugo/issues/599).
+* New boolean option `disallow_anonymous_connection_tokens`. When the option is set Centrifugo won't accept connections from anonymous users even if they provided a valid JWT. See [#591](https://github.com/centrifugal/centrifugo/issues/591)
+* New option `client_connection_rate_limit` to limit the number of new real-time connections Centrifugo may accept per second, see [docs](https://centrifugal.dev/docs/server/configuration#client_connection_rate_limit)
+* Implement `sub_refresh` proxy to periodically validate expiring subscriptions over the call from Centrifugo to the backend endpoint, see [#592](https://github.com/centrifugal/centrifugo/issues/592) and [docs](https://centrifugal.dev/docs/server/proxy#sub-refresh-proxy)
+* More human-readable tracing logging output (especially in Protobuf protocol case). On the other hand, tracing log level is much more expensive now. We never assumed it will be used in production – so seems an acceptable trade-off.
+* Several internal optimizations in client protocol to reduce memory allocations.
+* More strict client protocol: only allow one pong message from client to server after receiving ping, disable sending commands over the connection which returned an error to the Connect command
+
+### Fixes
+
+* Fix: slow down subscription dissolver workers while Redis PUB/SUB is unavailable. This solves a CPU usage spike which may happen while Redis PUB/SUB is unavailable and last client unsubscribes from some channel.
+* Relative static paths in Centrifugo admin web UI (to fix work behind reverse proxy on sub-path)
+
 v4.1.0
 ======
 

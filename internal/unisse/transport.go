@@ -10,21 +10,19 @@ import (
 type eventsourceTransport struct {
 	mu             sync.Mutex
 	req            *http.Request
-	messages       chan []byte
+	messages       chan [][]byte
 	disconnectCh   chan *centrifuge.Disconnect
 	closedCh       chan struct{}
 	closed         bool
-	protoVersion   centrifuge.ProtocolVersion
 	pingPongConfig centrifuge.PingPongConfig
 }
 
-func newEventsourceTransport(req *http.Request, protoVersion centrifuge.ProtocolVersion, pingPongConfig centrifuge.PingPongConfig) *eventsourceTransport {
+func newEventsourceTransport(req *http.Request, pingPongConfig centrifuge.PingPongConfig) *eventsourceTransport {
 	return &eventsourceTransport{
-		messages:       make(chan []byte),
+		messages:       make(chan [][]byte),
 		disconnectCh:   make(chan *centrifuge.Disconnect),
 		closedCh:       make(chan struct{}),
 		req:            req,
-		protoVersion:   protoVersion,
 		pingPongConfig: pingPongConfig,
 	}
 }
@@ -41,7 +39,7 @@ func (t *eventsourceTransport) Protocol() centrifuge.ProtocolType {
 
 // ProtocolVersion returns transport protocol version.
 func (t *eventsourceTransport) ProtocolVersion() centrifuge.ProtocolVersion {
-	return t.protoVersion
+	return centrifuge.ProtocolVersion2
 }
 
 // Unidirectional returns whether transport is unidirectional.
@@ -54,11 +52,9 @@ func (t *eventsourceTransport) DisabledPushFlags() uint64 {
 	return 0
 }
 
-// AppLevelPing ...
-func (t *eventsourceTransport) AppLevelPing() centrifuge.AppLevelPing {
-	return centrifuge.AppLevelPing{
-		PingInterval: t.pingPongConfig.PingInterval,
-	}
+// PingPongConfig ...
+func (t *eventsourceTransport) PingPongConfig() centrifuge.PingPongConfig {
+	return t.pingPongConfig
 }
 
 // Emulation ...
@@ -76,12 +72,10 @@ func (t *eventsourceTransport) WriteMany(messages ...[]byte) error {
 	if t.closed {
 		return nil
 	}
-	for i := 0; i < len(messages); i++ {
-		select {
-		case t.messages <- messages[i]:
-		case <-t.closedCh:
-			return nil
-		}
+	select {
+	case t.messages <- messages:
+	case <-t.closedCh:
+		return nil
 	}
 	return nil
 }
